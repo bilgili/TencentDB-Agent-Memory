@@ -12,7 +12,7 @@ import type {
   knowledgeWikiAudit,
   knowledgeCodeGraphAudit,
   llmBinding,
-} from "../db/schema.js";
+} from "../db/schema.sqlite.js";
 import type {
   AuditLogRow,
   CodeGraphMetaPatch,

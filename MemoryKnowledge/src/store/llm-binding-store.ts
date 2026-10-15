@@ -18,8 +18,9 @@
  */
 
 import { eq } from "drizzle-orm";
-import type { Db } from "../db/client.js";
-import { llmBinding } from "../db/schema.js";
+import type { Db, PgDb } from "../db/client.js";
+import type { PgTables } from "../db/schema.pg.js";
+import { llmBinding } from "../db/schema.sqlite.js";
 import type { LlmConfig } from "../config.js";
 import { mapLlmBindingRow } from "./rows.js";
 
@@ -60,6 +61,36 @@ export interface ILlmBindingStore {
   status(serviceId: string): Promise<LlmBindingStatus>;
 }
 
+/**
+ * Upsert column sets. api_key: undefined → 保留原值（仅 upsert 已存在记录时）；null → 清空；string → 更新。
+ * One statement: the "keep" case simply leaves api_key out of the conflict SET.
+ */
+function upsertSets(serviceId: string, input: LlmBindingInput) {
+  const values = {
+    serviceId,
+    mode: input.mode,
+    proxyBaseUrl: input.proxy_base_url ?? null,
+    apiKey: input.api_key ?? null,
+    baseUrl: input.base_url ?? null,
+    enabled: input.enabled === false ? 0 : 1,
+    updatedAt: new Date().toISOString(),
+  };
+  const set = {
+    mode: values.mode,
+    proxyBaseUrl: values.proxyBaseUrl,
+    ...(input.api_key !== undefined ? { apiKey: values.apiKey } : {}),
+    baseUrl: values.baseUrl,
+    enabled: values.enabled,
+    updatedAt: values.updatedAt,
+  };
+  return { values, set };
+}
+
+function toStatus(row: LlmBindingRow | null): LlmBindingStatus {
+  if (!row) return { bound: false, mode: null, enabled: false };
+  return { bound: true, mode: row.mode, enabled: row.enabled };
+}
+
 export function createLlmBindingStore(db: Db): ILlmBindingStore {
   // Synchronous better-sqlite3 work inside async methods: each method body
   // runs without an await, so it stays atomic.
@@ -78,41 +109,49 @@ export function createLlmBindingStore(db: Db): ILlmBindingStore {
     },
 
     async upsert(serviceId: string, input: LlmBindingInput): Promise<LlmBindingRow> {
-      const now = new Date().toISOString();
-      const values = {
-        serviceId,
-        mode: input.mode,
-        proxyBaseUrl: input.proxy_base_url ?? null,
-        apiKey: input.api_key ?? null,
-        baseUrl: input.base_url ?? null,
-        enabled: input.enabled === false ? 0 : 1,
-        updatedAt: now,
-      };
-      // api_key: undefined → 保留原值（仅 upsert 已存在记录时）；null → 清空；string → 更新。
-      // One statement: the "keep" case simply leaves api_key out of the conflict SET.
+      const { values, set } = upsertSets(serviceId, input);
       const row = db
         .insert(llmBinding)
         .values(values)
-        .onConflictDoUpdate({
-          target: llmBinding.serviceId,
-          set: {
-            mode: values.mode,
-            proxyBaseUrl: values.proxyBaseUrl,
-            ...(input.api_key !== undefined ? { apiKey: values.apiKey } : {}),
-            baseUrl: values.baseUrl,
-            enabled: values.enabled,
-            updatedAt: values.updatedAt,
-          },
-        })
+        .onConflictDoUpdate({ target: llmBinding.serviceId, set })
         .returning()
         .get();
       return mapLlmBindingRow(row);
     },
 
     async status(serviceId: string): Promise<LlmBindingStatus> {
-      const row = getSync(serviceId);
-      if (!row) return { bound: false, mode: null, enabled: false };
-      return { bound: true, mode: row.mode, enabled: row.enabled };
+      return toStatus(getSync(serviceId));
+    },
+  };
+}
+
+/** Postgres twin of createLlmBindingStore; same statements. */
+export function createPgLlmBindingStore(db: PgDb, tables: PgTables): ILlmBindingStore {
+  const t = tables.llmBinding;
+  const get = async (serviceId: string): Promise<LlmBindingRow | null> => {
+    const [row] = await db.select().from(t).where(eq(t.serviceId, serviceId));
+    return row ? mapLlmBindingRow(row) : null;
+  };
+
+  return {
+    get,
+
+    async listAll(): Promise<LlmBindingRow[]> {
+      return (await db.select().from(t)).map(mapLlmBindingRow);
+    },
+
+    async upsert(serviceId: string, input: LlmBindingInput): Promise<LlmBindingRow> {
+      const { values, set } = upsertSets(serviceId, input);
+      const [row] = await db
+        .insert(t)
+        .values(values)
+        .onConflictDoUpdate({ target: t.serviceId, set })
+        .returning();
+      return mapLlmBindingRow(row!);
+    },
+
+    async status(serviceId: string): Promise<LlmBindingStatus> {
+      return toStatus(await get(serviceId));
     },
   };
 }

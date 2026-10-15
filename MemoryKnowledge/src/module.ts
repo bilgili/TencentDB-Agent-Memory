@@ -11,16 +11,13 @@ import { mkdirSync, existsSync, rmSync } from "node:fs";
 import pLimit from "p-limit";
 import simpleGit from "simple-git";
 
-import type { Db } from "./db/client.js";
-import { SqliteKnowledgeStore, type IKnowledgeStore } from "./store/index.js";
+import type { KnowledgeDb } from "./db/client.js";
+import type { IKnowledgeStore } from "./store/index.js";
+import { openKnowledgeStores } from "./store/open-stores.js";
 import { WikiService, type WikiWorker } from "./store/index.js";
 import { CodeGraphService, type CodeGraphWorker } from "./store/index.js";
 import { BuildQueue } from "./store/index.js";
-import {
-  createLlmBindingStore,
-  resolveLlmConfig,
-  type ILlmBindingStore,
-} from "./store/llm-binding-store.js";
+import { resolveLlmConfig, type ILlmBindingStore } from "./store/llm-binding-store.js";
 import { createWikiSourceManager, type WikiSourceManager } from "./engines/wiki/index.js";
 import { indexProject, openIndex, syncIndex, getStats, closeIndex, type CodeGraphInstance } from "./engines/code/index.js";
 import { SourceFetcherRegistry } from "./source-fetcher/index.js";
@@ -34,7 +31,6 @@ import {
   type AutoSyncConfig,
   type WikiImporter,
 } from "./store/auto-sync-scheduler.js";
-import { createCredentialStore } from "./source-auth/credential-store.js";
 import type { ICredentialStore } from "./source-auth/types.js";
 import type { ISshKeyStore } from "./ssh-key/types.js";
 import { isSshUrl } from "./source-fetcher/ssh-options.js";
@@ -69,7 +65,8 @@ async function headCommitIfGit(dir: string): Promise<string | undefined> {
 
 export interface KnowledgeModuleConfig {
   dataDir: string;
-  db: Db;
+  /** Opened and migrated central DB (createKnowledgeDb + migrateKnowledgeDb). */
+  knowledgeDb: KnowledgeDb;
   /** LLM configuration for wiki ingest. */
   llmConfig: LlmConfig;
   /** TMC callback URL for status notifications (empty = no callback). */
@@ -133,15 +130,16 @@ export interface KnowledgeModule {
  * and returns; the caller calls serve() only after it resolves (step 6).
  */
 export async function createKnowledgeModule(config: KnowledgeModuleConfig): Promise<KnowledgeModule> {
-  const { dataDir, db, llmConfig } = config;
+  const { dataDir, knowledgeDb, llmConfig } = config;
 
-  // Store
-  const store = new SqliteKnowledgeStore(db);
+  // Stores — picked by dialect (SQLite / Postgres)
+  const stores = openKnowledgeStores(knowledgeDb);
+  const store = stores.store;
 
   // Per-instance LLM routing binding + resolver (proxy/byo → effective LlmConfig).
   // No binding → global LLM_MODE decides: 'custom' uses global LLM_* direct,
   // 'proxy' (default) blanks creds so ingest fails loudly (no silent fallback).
-  const llmBindingStore = createLlmBindingStore(db);
+  const llmBindingStore = stores.llmBindingStore;
   const resolveLlm = async (serviceId: string): Promise<LlmConfig> =>
     resolveLlmConfig(serviceId, await llmBindingStore.get(serviceId), llmConfig);
 
@@ -172,7 +170,7 @@ export async function createKnowledgeModule(config: KnowledgeModuleConfig): Prom
   const fetcherRegistry = new SourceFetcherRegistry();
 
   // ── 外部来源凭据存储（base64；无密钥；见 §4.1.3） ──
-  const credentialStore = config.credentialStore ?? createCredentialStore({ db });
+  const credentialStore = config.credentialStore ?? stores.credentialStore;
 
   // ── SSH 密钥存储（每用户一对 RSA；SSH 仓库 clone 时注入 GIT_SSH_COMMAND）──
   const sshKeyStore = config.sshKeyStore;

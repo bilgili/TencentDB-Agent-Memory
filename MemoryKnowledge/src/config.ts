@@ -8,6 +8,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import 'dotenv/config';
+import type { KnowledgeDbConfig } from "./db/client.js";
 
 /** Expand leading ~/ to the user's home directory. */
 function expandHome(filepath: string): string {
@@ -75,8 +76,11 @@ export interface ServiceConfig {
    * 默认 `${dataDir}/ssh-keys` —— 落在已挂载的持久化数据卷内。
    */
   sshKeyDir: string;
-  /** SQLite database file path. */
-  dbPath: string;
+  /**
+   * Central DB. `url` (KNOWLEDGE_DB_URL, postgres:// or postgresql://) selects
+   * Postgres; empty → SQLite at `path` (KNOWLEDGE_DB_PATH). Validated by createKnowledgeDb.
+   */
+  db: KnowledgeDbConfig;
   /** LLM configuration for wiki ingest. */
   llm: LlmConfig;
   /** Log level. */
@@ -175,7 +179,12 @@ export function loadConfig(): ServiceConfig {
     dataDir,
     // 未显式配置 → 落在数据卷内，随 /data/knowledge 一起持久化。
     sshKeyDir: expandHome(env("KNOWLEDGE_SSH_KEY_DIR", join(dataDir, "ssh-keys"))),
-    dbPath: expandHome(env("KNOWLEDGE_DB_PATH", "./data/knowledge.db")),
+    db: {
+      path: expandHome(env("KNOWLEDGE_DB_PATH", "./data/knowledge.db")),
+      url: env("KNOWLEDGE_DB_URL", ""),
+      schema: env("KNOWLEDGE_DB_SCHEMA", "knowledge"),
+      poolMax: envInt("KNOWLEDGE_DB_POOL_MAX", 10),
+    },
     logLevel: env("LOG_LEVEL", "debug"),
     apiPrefix: env("API_PREFIX", "/v3"),
     publicBaseUrl: env("KNOWLEDGE_PUBLIC_BASE_URL", ""),

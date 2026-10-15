@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { createDb, migrate } from "../../db/client.js";
+import { createDb, migrateSqlite } from "../../db/client.js";
 import { isUniqueViolation } from "../../db/errors.js";
 import { createCredentialStore } from "../../source-auth/credential-store.js";
 import { createLlmBindingStore } from "../llm-binding-store.js";
@@ -78,7 +78,8 @@ describe("SQLite migration of build_run_id", () => {
       INSERT INTO knowledge_wiki (wiki_id, service_id, team_id, name, status, version, created_at, updated_at)
         VALUES ('wiki-old', 's', 't', 'old', 'ready', 4, '2026-01-01', '2026-01-01');
     `);
-    migrate(db, raw);
+    expect(migrateSqlite(raw)).toEqual([1, 2, 3, 4, 5]);
+    expect(migrateSqlite(raw)).toEqual([]); // idempotent: versions recorded
     const cols = (t: string) => (raw.pragma(`table_info(${t})`) as Array<{ name: string }>).map((c) => c.name);
     expect(cols("knowledge_wiki")).toContain("build_run_id");
     expect(cols("knowledge_code_graph")).toContain("build_run_id");

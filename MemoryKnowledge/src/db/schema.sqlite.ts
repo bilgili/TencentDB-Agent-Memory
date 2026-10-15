@@ -1,5 +1,8 @@
 /**
- * Drizzle ORM schema — 4 SQLite tables for knowledge metadata.
+ * Drizzle ORM schema (SQLite dialect) for the knowledge metadata tables.
+ * The Postgres twin is schema.pg.ts (same camelCase keys, same column names);
+ * the DDL lives in db/migrations/sqlite.ts. src/db/schema-drift.test.ts keeps
+ * all three aligned.
  *
  * Tables:
  *   knowledge_code_graph       — code repo index metadata + status
@@ -167,6 +170,8 @@ export const llmBinding = sqliteTable("llm_binding", {
   mode: text("mode").notNull().default("proxy"),
   proxyBaseUrl: text("proxy_base_url"),
   apiKey: text("api_key"),
+  // In the DDL since the table was created; not read (model comes from LLM_MODEL).
+  model: text("model"),
   baseUrl: text("base_url"),
   enabled: integer("enabled").notNull().default(1),
   updatedAt: text("updated_at").notNull(),

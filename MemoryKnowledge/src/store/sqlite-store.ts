@@ -26,7 +26,7 @@ import {
   knowledgeCodeGraphAudit,
   CODE_DATA_VERSION,
   WIKI_DATA_VERSION,
-} from "../db/schema.js";
+} from "../db/schema.sqlite.js";
 import { genCodeGraphId, genWikiId } from "./ids.js";
 import {
   claimSet,

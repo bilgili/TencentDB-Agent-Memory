@@ -7,6 +7,9 @@
  * Minimal config (zero config): {} — all fields have sensible defaults.
  */
 
+import type { DbKind } from "./core/backend-selection/types.js";
+import { isDbKind } from "./core/backend-selection/traits.js";
+
 // ============================
 // Type definitions
 // ============================
@@ -205,8 +208,20 @@ export interface TcvdbConfig {
   caPemPath?: string;
 }
 
-/** Storage backend type. */
-export type StoreBackend = "sqlite" | "tcvdb" | "mongodb";
+/** Storage backend type — an alias of the one kind list, `DbKind`. */
+export type StoreBackend = DbKind;
+
+/**
+ * Postgres settings for the plugin / TdaiCore path (`memory.postgres.*`).
+ * Raw values; `createStoreBundle` validates them with `parsePostgresSettings`.
+ */
+export interface PostgresStoreConfig {
+  url: string;
+  /** Schema prefix (default "tdai"). */
+  schemaPrefix?: string;
+  /** Pool size (default 10). */
+  poolMax?: number;
+}
 
 /** Report settings — controls metric/event reporting. */
 export interface ReportConfig {
@@ -362,8 +377,10 @@ export interface MemoryTdaiConfig {
   pipeline: PipelineTriggerConfig;
   recall: RecallConfig;
   embedding: EmbeddingConfig;
-  /** Storage backend: "sqlite" (default) or "tcvdb" */
+  /** Storage backend: "sqlite" (default), "tcvdb", "mongodb" or "postgres" */
   storeBackend: StoreBackend;
+  /** Postgres configuration (used when storeBackend = "postgres") */
+  postgres: PostgresStoreConfig;
   /** Tencent Cloud VectorDB configuration (required when storeBackend = "tcvdb") */
   tcvdb: TcvdbConfig;
   /** BM25 sparse vector encoding (local @tencentdb-agent-memory/tcvdb-text) */
@@ -580,10 +597,8 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
 
   // --- Store backend ---
   const storeBackendRaw = str(c, "storeBackend") ?? "sqlite";
-  const storeBackend: StoreBackend =
-    storeBackendRaw === "tcvdb" ? "tcvdb"
-    : storeBackendRaw === "mongodb" ? "mongodb"
-    : "sqlite";
+  const storeBackend: StoreBackend = isDbKind(storeBackendRaw) ? storeBackendRaw : "sqlite";
+  const postgresGroup = obj(c, "postgres");
 
   // --- TCVDB config ---
   const tcvdbGroup = obj(c, "tcvdb");
@@ -713,6 +728,11 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       configError: embeddingConfigError,
     },
     storeBackend,
+    postgres: {
+      url: resolveExactEnvReference(str(postgresGroup, "url") ?? ""),
+      schemaPrefix: str(postgresGroup, "schemaPrefix"),
+      poolMax: num(postgresGroup, "poolMax"),
+    },
     tcvdb: {
       url: str(tcvdbGroup, "url") ?? "",
       username: str(tcvdbGroup, "username") ?? "root",

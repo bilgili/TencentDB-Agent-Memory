@@ -5,6 +5,8 @@
  * Supports:
  * - "sqlite" (default): local SQLite + sqlite-vec + FTS5
  * - "tcvdb": Tencent Cloud VectorDB (server-side embedding + hybridSearch)
+ * - "mongodb": MongoDB (MONGODB_* env)
+ * - "postgres": Postgres + pgvector (memory.postgres.*) — store implementation pending
  *
  * Both backends ship with core — TCVDB is a vendor-provided store that has
  * always been part of the open-source surface of this plugin (matches the
@@ -23,6 +25,7 @@ import { createEmbeddingService, NoopEmbeddingService } from "./embedding.js";
 import type { EmbeddingService } from "./embedding.js";
 import { createBM25Encoder } from "./bm25-local.js";
 import type { BM25LocalEncoder } from "./bm25-local.js";
+import { parsePostgresSettings, PLUGIN_POSTGRES_SETTING_NAMES, redactUrl } from "./postgres/settings.js";
 
 // Re-export for convenience
 export type { IMemoryStore, IEmbeddingService, StoreLogger, BM25LocalEncoder };
@@ -127,8 +130,14 @@ export function createStoreBundle(
       };
     }
 
-    case "sqlite":
-    default: {
+    case "postgres": {
+      // Validate first so a bad memory.postgres.* setting fails at startup with its name.
+      const settings = parsePostgresSettings(config.postgres, PLUGIN_POSTGRES_SETTING_NAMES);
+      // ponytail: PostgresMemoryStore lands in a later commit.
+      throw new Error(`${TAG} Postgres store not implemented yet (url=${redactUrl(settings.url)})`);
+    }
+
+    case "sqlite": {
       // ── Embedding service (only when enabled) ──
       let embeddingService: EmbeddingService | undefined;
       if (config.embedding.enabled && config.embedding.provider !== "local" && config.embedding.apiKey) {
@@ -163,6 +172,11 @@ export function createStoreBundle(
           sqlitePath: path.relative(options.dataDir, dbPath),
         },
       };
+    }
+
+    default: {
+      const unknownBackend: never = config.storeBackend;
+      throw new Error(`${TAG} unknown storeBackend: ${String(unknownBackend)}`);
     }
   }
 }

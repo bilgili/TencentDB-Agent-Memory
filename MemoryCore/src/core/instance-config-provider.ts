@@ -18,7 +18,9 @@
  */
 
 import type { IConfigSource } from "./abstractions/index.js";
-import { readVdbEnvConfig, readCosEnvConfig, readMongoEnvConfig } from "../utils/env-config.js";
+import { readVdbEnvConfig, readCosEnvConfig, readMongoEnvConfig, readPostgresEnvConfig } from "../utils/env-config.js";
+import { pgSchemaName } from "./store/postgres/schema-name.js";
+import { parsePostgresSettings } from "./store/postgres/settings.js";
 
 // ════════════════════════════════════════════════════════
 // Types
@@ -43,6 +45,19 @@ export interface MongoConfig {
   user: string;
   password: string;
   database: string;
+}
+
+/**
+ * Per-instance Postgres connection info.
+ *
+ * `schema` is the instance's full memory/skill schema name, already derived by
+ * `pgSchemaName("mem", instanceId, prefix)`; stores never compute it. Many
+ * instances share one URL, and so one pool (`PgPoolRegistry`).
+ */
+export interface PostgresConfig {
+  url: string;
+  schema: string;
+  poolMax: number;
 }
 
 export interface CosConfig {
@@ -98,6 +113,16 @@ export class LocalConfigSource implements IConfigSource {
 
   async fetchMongo(_instanceId: string): Promise<MongoConfig> {
     return readMongoEnvConfig();
+  }
+
+  /** POSTGRES_* env + the instance's memory schema name. Throws on invalid settings. */
+  async fetchPostgres(instanceId: string): Promise<PostgresConfig> {
+    const settings = parsePostgresSettings(readPostgresEnvConfig());
+    return {
+      url: settings.url,
+      schema: pgSchemaName("mem", instanceId, settings.schemaPrefix),
+      poolMax: settings.poolMax,
+    };
   }
 
   async fetchCos(): Promise<CosConfig | null> {
@@ -324,6 +349,26 @@ export class InstanceConfigProvider {
       lastAccessedAt: now,
     });
 
+    return config;
+  }
+
+  /**
+   * Resolve the instance's Postgres config. No cache: LocalConfigSource only
+   * reads env vars, which is cheap.
+   * ponytail: no TTL cache; add one (like resolveMongo) when a remote source implements fetchPostgres.
+   */
+  async resolvePostgres(instanceId: string): Promise<PostgresConfig> {
+    if (typeof this.source.fetchPostgres !== "function") {
+      const msg = `[instance-config] Config source (${this.source.constructor.name}) does not implement fetchPostgres — postgres backend unavailable`;
+      this.logger.error(msg);
+      throw new Error(msg);
+    }
+    const config = await this.source.fetchPostgres(instanceId);
+    if (!config || !config.url || !config.schema) {
+      const msg = `[instance-config] Config source returned incomplete Postgres config for instanceId="${instanceId}" (schema=${config?.schema})`;
+      this.logger.error(msg);
+      throw new Error(msg);
+    }
     return config;
   }
 

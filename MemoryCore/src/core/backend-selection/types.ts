@@ -12,9 +12,14 @@
  * process boundaries.
  */
 
-import type { CosConfig, MongoConfig, VdbConfig } from "../instance-config-provider.js";
+import type { CosConfig, MongoConfig, PostgresConfig, VdbConfig } from "../instance-config-provider.js";
 
-export type DbKind = "sqlite" | "tcvdb" | "mongodb";
+/**
+ * The one owner of the database-kind list. Every
+ * other kind type (StoreBackend, StoreMode, skill/manifest kinds) aliases or
+ * derives from it; kind-dependent behavior reads `DB_TRAITS` (traits.ts).
+ */
+export type DbKind = "sqlite" | "tcvdb" | "mongodb" | "postgres";
 
 /**
  * Env-surface vocabulary for `FILE_STORE_MODE` (两轴模型定稿 §5 映射的输入侧).
@@ -53,7 +58,8 @@ export type FsOthersKind = "local" | "cos" | "mongofs";
 export type DbChoice =
   | { kind: "sqlite"; conn: null }
   | { kind: "tcvdb"; conn: VdbConfig }
-  | { kind: "mongodb"; conn: MongoConfig };
+  | { kind: "mongodb"; conn: MongoConfig }
+  | { kind: "postgres"; conn: PostgresConfig };
 
 export type FsOthersChoice =
   | { kind: "local"; conn: null }
@@ -78,6 +84,7 @@ export interface BackendResolution {
 export interface BackendConfigSource {
   resolveVdb(instanceId: string): Promise<VdbConfig>;
   resolveMongo(instanceId: string): Promise<MongoConfig>;
+  resolvePostgres(instanceId: string): Promise<PostgresConfig>;
   resolveCos(): Promise<CosConfig | null>;
 }
 

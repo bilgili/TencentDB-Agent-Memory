@@ -72,6 +72,7 @@ import type {
 import { DEFAULT_PAGINATION } from "../pagination.js";
 import { buildChatMemoryAssetId } from "../utils/chat-memory-asset.js";
 import { DuplicateUserKeyError } from "./interface.js";
+import { isUniqueViolation } from "../../core/store/errors.js";
 
 const require = createRequire(import.meta.url);
 function requireNodeSqlite(): typeof import("node:sqlite") {
@@ -86,14 +87,13 @@ const PK_RETRY_LIMIT = 3;
 
 /** Returns true if the error is a SQLite UNIQUE constraint failure on a generated primary key column. */
 function isPkCollision(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /UNIQUE constraint failed: meta_\w+\.(user_id|team_id|agent_id|task_id|asset_id|acl_id|key_id)\b/.test(msg);
+  return isUniqueViolation(err) && err instanceof Error &&
+    /\bmeta_\w+\.(user_id|team_id|agent_id|task_id|asset_id|acl_id|key_id)\b/.test(err.message);
 }
 
 /** Returns true if the error is a SQLite UNIQUE constraint failure on meta_user_keys.key_value. */
 function isUserKeyValueCollision(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /UNIQUE constraint failed: meta_user_keys\.key_value\b/.test(msg);
+  return isUniqueViolation(err) && err instanceof Error && /\bmeta_user_keys\.key_value\b/.test(err.message);
 }
 
 function isStorePkCollision(err: unknown): boolean {

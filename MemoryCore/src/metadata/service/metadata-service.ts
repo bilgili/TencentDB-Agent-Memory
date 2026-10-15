@@ -13,6 +13,7 @@
  */
 
 import { DuplicateUserKeyError, type IMetadataStore } from "../store/interface.js";
+import { isUniqueViolation as isDriverUniqueViolation } from "../../core/store/errors.js";
 // UserSessionDefaultService (v3.3): 值 import, 用于 MetadataService.userSessionDefault
 // 懒初始化。循环 import 风险: 该 service 回头 import MetadataError (值) + MetadataService
 // (类型), MetadataError 是本模块的 class, 顶层 class 声明在 import 之前已完成 hoisting,
@@ -163,19 +164,14 @@ export type ChatMemoryContentCleaner = (params: {
   agentId: string;
 }) => Promise<void>;
 
-/** Detect unique constraint violation (SQLite UNIQUE or MongoDB E11000) on a specific column. */
+/** Detect a unique constraint violation (any driver) on a specific column. */
 function isUniqueViolation(err: unknown, column?: string): boolean {
-  if (!(err instanceof Error)) return false;
-  const msg = err.message;
-  if (/UNIQUE constraint failed/.test(msg)) {
-    return column ? msg.includes(column) : true;
-  }
-  if ((err as any).code === 11000) {
-    if (!column) return true;
-    const kp = (err as any).keyPattern;
-    return kp ? column in kp : msg.includes(column);
-  }
-  return false;
+  if (!(err instanceof Error) || !isDriverUniqueViolation(err)) return false;
+  if (!column) return true;
+  const { keyPattern, detail } = err as { keyPattern?: Record<string, unknown>; detail?: string };
+  if (keyPattern) return column in keyPattern;
+  // SQLite names columns in the message; Postgres in `detail` ("Key (col)=(…) already exists.").
+  return err.message.includes(column) || (detail?.includes(column) ?? false);
 }
 
 export interface AgentBasicData {

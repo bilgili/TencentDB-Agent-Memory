@@ -122,6 +122,27 @@ export function readMongoEnvConfig(): MongoEnvConfig {
   };
 }
 
+/** Raw `POSTGRES_*` values; `parsePostgresSettings` validates them and applies defaults. */
+export interface PostgresEnvConfig {
+  url: string;
+  schemaPrefix: string;
+  poolMax: string;
+}
+
+/**
+ * Read the gateway Postgres store variables:
+ *   POSTGRES_URL            — postgres:// or postgresql:// URL
+ *   POSTGRES_SCHEMA_PREFIX  — schema prefix (default "tdai")
+ *   POSTGRES_POOL_MAX       — pool size per URL (default 10)
+ */
+export function readPostgresEnvConfig(): PostgresEnvConfig {
+  return {
+    url: ENV.POSTGRES_URL ?? "",
+    schemaPrefix: ENV.POSTGRES_SCHEMA_PREFIX ?? "",
+    poolMax: ENV.POSTGRES_POOL_MAX ?? "",
+  };
+}
+
 /**
  * Optional COS credentials. Returns `null` if `COS_SECRET_ID` is unset
  * (the marker we use to mean "COS not configured for this deployment").

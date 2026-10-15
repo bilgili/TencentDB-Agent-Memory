@@ -2,20 +2,18 @@
  * 关联表 `id` 列插入：碰撞检测与重试（配合 generateRelationId）。
  */
 import { generateRelationId } from "../utils/id-generator.js";
+import { isUniqueViolation } from "../../core/store/errors.js";
 
 export const RELATION_ID_RETRY_LIMIT = 3;
 
 /** SQLite：关联表主键 `id` 唯一约束冲突。 */
 export function isSqliteRelationIdCollision(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /UNIQUE constraint failed: meta_\w+\.id\b/.test(msg);
+  return isUniqueViolation(err) && err instanceof Error && /\bmeta_\w+\.id\b/.test(err.message);
 }
 
 /** MongoDB：关联表主键 `id` 重复键（E11000）。 */
 export function isMongoRelationIdCollision(err: unknown): boolean {
-  if (typeof err !== "object" || err === null) return false;
-  const e = err as { code?: number; keyPattern?: Record<string, unknown> };
-  return e.code === 11000 && Boolean(e.keyPattern?.id);
+  return isUniqueViolation(err) && Boolean((err as { keyPattern?: Record<string, unknown> }).keyPattern?.id);
 }
 
 /**

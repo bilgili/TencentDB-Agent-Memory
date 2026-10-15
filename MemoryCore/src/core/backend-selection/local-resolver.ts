@@ -69,6 +69,12 @@ export class LocalBackendResolver implements BackendResolver {
         return { kind, conn: await this.deps.source.resolveVdb(instanceId) };
       case "mongodb":
         return { kind, conn: await this.deps.source.resolveMongo(instanceId) };
+      case "postgres":
+        return { kind, conn: await this.deps.source.resolvePostgres(instanceId) };
+      default: {
+        const unknownKind: never = kind;
+        throw new BackendResolutionError(`unknown db kind: ${String(unknownKind)}`);
+      }
     }
   }
 

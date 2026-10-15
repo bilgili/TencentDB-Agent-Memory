@@ -905,9 +905,9 @@ export class SqliteMetadataStore implements IMetadataStore {
   // ============================================================
   // TeamMember
   // ============================================================
-  addTeamMember(input: AddTeamMemberInput): TeamMemberEntity {
+  async addTeamMember(input: AddTeamMemberInput): Promise<TeamMemberEntity> {
     const now = nowIso();
-    runWithGeneratedRelationId(input.id, isSqliteRelationIdCollision, (id) => {
+    await runWithGeneratedRelationId(input.id, isSqliteRelationIdCollision, (id) => {
       this.run(
         `INSERT INTO meta_team_members (id, team_id, user_id, role, joined_at, status)
        VALUES (?,?,?,?,?,?)
@@ -1214,9 +1214,9 @@ export class SqliteMetadataStore implements IMetadataStore {
   // ============================================================
   // TaskAgent
   // ============================================================
-  linkTaskAgent(taskId: string, agentId: string, roleInTask?: string): TaskAgentEntity {
+  async linkTaskAgent(taskId: string, agentId: string, roleInTask?: string): Promise<TaskAgentEntity> {
     const now = nowIso();
-    runWithGeneratedRelationId(undefined, isSqliteRelationIdCollision, (id) => {
+    await runWithGeneratedRelationId(undefined, isSqliteRelationIdCollision, (id) => {
       this.run(
         `INSERT INTO meta_task_agents (id, task_id, agent_id, role_in_task, status, created_at)
        VALUES (?,?,?,?,?,?)
@@ -1583,9 +1583,9 @@ export class SqliteMetadataStore implements IMetadataStore {
   // ============================================================
   // ACL
   // ============================================================
-  grantAcl(input: GrantAclInput): AclEntity {
+  async grantAcl(input: GrantAclInput): Promise<AclEntity> {
     const now = nowIso();
-    runWithGeneratedRelationId(input.id, isSqliteRelationIdCollision, (id) => {
+    await runWithGeneratedRelationId(input.id, isSqliteRelationIdCollision, (id) => {
       this.run(
         `INSERT INTO meta_asset_acl
         (id, asset_id, subject_type, subject_id, permission, effect, granted_by, created_at, updated_at)

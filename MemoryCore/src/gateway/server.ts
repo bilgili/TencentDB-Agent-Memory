@@ -515,7 +515,7 @@ export class TdaiGateway {
         this.ensureMetadataStore(instanceId),
         this.ensureMetadataStorePool(),
       ]);
-      const storeSource = pool.backend === "mongodb" ? "mongodb-adapter.ts" : "sqlite-adapter.ts";
+      const storeSource = `${pool.backend}-adapter.ts`;
       const rawSvc = new MetadataService(
         wrapApiStoreForTrace(store, storeSource),
         instanceId,

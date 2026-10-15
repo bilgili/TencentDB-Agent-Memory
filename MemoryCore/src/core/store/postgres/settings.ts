@@ -41,7 +41,15 @@ export const PLUGIN_POSTGRES_SETTING_NAMES: PostgresSettingNames = {
   poolMax: "memory.postgres.poolMax",
 };
 
+/** Metadata store (`TDAI_METADATA_POSTGRES_*`). */
+export const METADATA_POSTGRES_SETTING_NAMES: PostgresSettingNames = {
+  url: "TDAI_METADATA_POSTGRES_URL",
+  schemaPrefix: "TDAI_METADATA_POSTGRES_SCHEMA_PREFIX",
+  poolMax: "TDAI_METADATA_POSTGRES_POOL_MAX",
+};
+
 export const DEFAULT_POSTGRES_POOL_MAX = 10;
+export const DEFAULT_METADATA_POSTGRES_POOL_MAX = 5;
 
 /** Replace the password (userinfo and `?password=`) with `***`. Never throws. */
 export function redactUrl(url: string): string {

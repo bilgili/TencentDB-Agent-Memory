@@ -22,6 +22,9 @@ export const LOCK_CLASS_KNOWLEDGE_SINGLETON = 0x7464_0004;
 
 /** DDL lock wait limit. */
 export const MIGRATION_LOCK_TIMEOUT = "30s";
+/** Write-transaction limits (withWriteTx): lock wait, and any one statement. */
+export const WRITE_LOCK_TIMEOUT = "30s";
+export const WRITE_STATEMENT_TIMEOUT = "60s";
 
 export type TxClient = pg.PoolClient;
 
@@ -55,6 +58,9 @@ export async function withTx<T>(pool: pg.Pool, fn: (client: TxClient) => Promise
  */
 export function withWriteTx<T>(pool: pg.Pool, schema: string, fn: (client: TxClient) => Promise<T>): Promise<T> {
   return withTx(pool, async (client) => {
+    // Bounded waits: a stuck lock holder fails writers instead of hanging them.
+    await client.query(`SET LOCAL lock_timeout = '${WRITE_LOCK_TIMEOUT}'`);
+    await client.query(`SET LOCAL statement_timeout = '${WRITE_STATEMENT_TIMEOUT}'`);
     await client.query("SELECT pg_advisory_xact_lock($1, hashtext($2))", [LOCK_CLASS_WRITE, schema]);
     return fn(client);
   });

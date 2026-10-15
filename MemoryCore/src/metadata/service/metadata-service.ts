@@ -164,16 +164,6 @@ export type ChatMemoryContentCleaner = (params: {
   agentId: string;
 }) => Promise<void>;
 
-/** Detect a unique constraint violation (any driver) on a specific column. */
-function isUniqueViolation(err: unknown, column?: string): boolean {
-  if (!(err instanceof Error) || !isDriverUniqueViolation(err)) return false;
-  if (!column) return true;
-  const { keyPattern, detail } = err as { keyPattern?: Record<string, unknown>; detail?: string };
-  if (keyPattern) return column in keyPattern;
-  // SQLite names columns in the message; Postgres in `detail` ("Key (col)=(…) already exists.").
-  return err.message.includes(column) || (detail?.includes(column) ?? false);
-}
-
 export interface AgentBasicData {
   agent_id: string;
   team_id: string;

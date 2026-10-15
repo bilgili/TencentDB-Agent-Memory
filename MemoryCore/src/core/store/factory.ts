@@ -6,7 +6,7 @@
  * - "sqlite" (default): local SQLite + sqlite-vec + FTS5
  * - "tcvdb": Tencent Cloud VectorDB (server-side embedding + hybridSearch)
  * - "mongodb": MongoDB (MONGODB_* env)
- * - "postgres": Postgres + pgvector (memory.postgres.*), schema of the "default" instance
+ * - "postgres": Postgres + pgvector (memory.postgres.*, else POSTGRES_* env), schema of the "default" instance
  *
  * Both backends ship with core — TCVDB is a vendor-provided store that has
  * always been part of the open-source surface of this plugin (matches the
@@ -20,12 +20,17 @@ import { VectorStore } from "./sqlite/memory-store.js";
 import { TcvdbMemoryStore } from "./tcvdb/memory-store.js";
 import { MongoMemoryStore } from "./mongodb/memory-store.js";
 import { getSharedMongoClientPool } from "./mongodb/client-pool.js";
-import { readMongoEnvConfig } from "../../utils/env-config.js";
+import { readMongoEnvConfig, readPostgresEnvConfig } from "../../utils/env-config.js";
 import { createEmbeddingService, NoopEmbeddingService } from "./embedding.js";
 import type { EmbeddingService } from "./embedding.js";
 import { createBM25Encoder } from "./bm25-local.js";
 import type { BM25LocalEncoder } from "./bm25-local.js";
-import { parsePostgresSettings, PLUGIN_POSTGRES_SETTING_NAMES, redactUrl } from "./postgres/settings.js";
+import {
+  GATEWAY_POSTGRES_SETTING_NAMES,
+  parsePostgresSettings,
+  PLUGIN_POSTGRES_SETTING_NAMES,
+  redactUrl,
+} from "./postgres/settings.js";
 import { getSharedPgPoolRegistry } from "./postgres/pool-registry.js";
 import { pgSchemaName } from "./postgres/schema-name.js";
 import { PostgresMemoryStore } from "./postgres/memory-store.js";
@@ -148,13 +153,18 @@ export function createStoreBundle(
     }
 
     case "postgres": {
-      // Validate first so a bad memory.postgres.* setting fails at startup with its name.
-      const settings = parsePostgresSettings(config.postgres, PLUGIN_POSTGRES_SETTING_NAMES);
+      // memory.postgres.* wins; without memory.postgres.url fall back to the gateway
+      // POSTGRES_* env, as the mongodb branch reads MONGODB_* (the deploy script
+      // writes only memory.storeBackend). Validate first so a bad setting fails at
+      // startup with the name of the surface it came from.
+      const settings = config.postgres?.url?.trim()
+        ? parsePostgresSettings(config.postgres, PLUGIN_POSTGRES_SETTING_NAMES)
+        : parsePostgresSettings(readPostgresEnvConfig(), GATEWAY_POSTGRES_SETTING_NAMES);
       // The plugin path serves one instance: the same "default" id as dataDir/vectors.db.
       const schema = pgSchemaName("mem", "default", settings.schemaPrefix);
       const dims = config.embedding.dimensions;
       const store = new PostgresMemoryStore({
-        pool: getSharedPgPoolRegistry(logger).get(settings.url, settings.poolMax),
+        pool: getSharedPgPoolRegistry(logger).get("store", settings.url, settings.poolMax),
         schema,
         dimensions: dims,
         logger,

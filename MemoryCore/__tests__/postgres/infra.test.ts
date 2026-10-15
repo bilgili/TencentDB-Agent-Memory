@@ -93,6 +93,17 @@ describe("pgSchemaName / validateSchemaPrefix", () => {
     expect(() => pgSchemaName("mem", "", "tdai")).toThrow(/empty/);
   });
 
+  it("a valid id shaped like a hashed name is hashed, so it never collides with that id's source", () => {
+    const hashed = pgSchemaName("mem", "Acme", "tdai");
+    expect(hashed).toMatch(/^tdai_mem_acme_[0-9a-f]{10}$/);
+    const lookalike = hashed.slice("tdai_mem_".length); // "acme_<10hex>": valid chars, fits
+    const other = pgSchemaName("mem", lookalike, "tdai");
+    expect(other).not.toBe(hashed);
+    expect(other).toMatch(new RegExp(`^tdai_mem_${lookalike}_[0-9a-f]{10}$`));
+    // A plain `_` + hex-like tail that is not 10 hex chars still passes through.
+    expect(pgSchemaName("mem", "acme_2024", "tdai")).toBe("tdai_mem_acme_2024");
+  });
+
   it("accepts valid prefixes and refuses invalid or reserved ones, naming the setting", () => {
     for (const p of ["tdai", "_x", "a1_b2", "p".repeat(16)]) expect(validateSchemaPrefix(p)).toBe(p);
     for (const p of ["", "Tdai", "1abc", "a-b", "p".repeat(17), "pg_x", "pg"]) {
@@ -100,6 +111,32 @@ describe("pgSchemaName / validateSchemaPrefix", () => {
     }
     // "pgx" does not produce a pg_ schema name.
     expect(validateSchemaPrefix("pgx")).toBe("pgx");
+  });
+});
+
+describe("PgPoolRegistry owners", () => {
+  it("same URL, two owners → two distinct pools, each with its own max and a connect timeout", async () => {
+    const registry = new PgPoolRegistry();
+    const url = "postgres://u:pw@127.0.0.1:1/none"; // pools connect lazily; nothing dials here
+    const store = registry.get("store", url, 10);
+    const meta = registry.get("meta", url, 3);
+    expect(meta).not.toBe(store);
+    expect(registry.size).toBe(2);
+    expect(store.options.max).toBe(10);
+    expect(meta.options.max).toBe(3);
+    expect(store.options.connectionTimeoutMillis).toBe(10_000);
+    await registry.endAll();
+  });
+
+  it("an idle-client error is logged even when the registry was created without a logger", async () => {
+    const registry = new PgPoolRegistry();
+    const pool = registry.get("meta", "postgres://u:pw@127.0.0.1:1/none", 1);
+    const warn = vi.fn();
+    registry.useLogger({ ...silentLogger, warn });
+    pool.emit("error", new Error("boom"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("boom"));
+    expect(warn.mock.calls[0]![0]).not.toContain("pw");
+    await registry.endAll();
   });
 });
 
@@ -226,7 +263,7 @@ describePg("postgres infrastructure", () => {
   const newPool = (url: string = TEST_POSTGRES_URL!): pg.Pool => {
     const registry = new PgPoolRegistry();
     registries.push(registry);
-    return registry.get(url, 4);
+    return registry.get("store", url, 4);
   };
 
   let shared: pg.Pool;
@@ -245,16 +282,16 @@ describePg("postgres infrastructure", () => {
     return Object.fromEntries(rows.map((r) => [r.version, r.n]));
   }
 
-  it("PgPoolRegistry keeps one pool per URL and endAll ends it", async () => {
+  it("PgPoolRegistry keeps one pool per owner and URL and endAll ends it", async () => {
     const registry = new PgPoolRegistry();
-    const a = registry.get(TEST_POSTGRES_URL!, 2);
-    expect(registry.get(TEST_POSTGRES_URL!, 5)).toBe(a);
+    const a = registry.get("store", TEST_POSTGRES_URL!, 2);
+    expect(registry.get("store", TEST_POSTGRES_URL!, 5)).toBe(a);
     expect(registry.size).toBe(1);
     expect((await a.query<{ one: number }>("SELECT 1 AS one")).rows[0]!.one).toBe(1);
     await registry.endAll();
     expect(registry.size).toBe(0);
     expect(a.ended).toBe(true);
-    const b = registry.get(TEST_POSTGRES_URL!, 2);
+    const b = registry.get("store", TEST_POSTGRES_URL!, 2);
     expect(b).not.toBe(a);
     await registry.endAll();
   });
@@ -307,6 +344,15 @@ describePg("postgres infrastructure", () => {
     await Promise.all([bump(), bump(), bump()]);
     const { rows } = await shared.query<{ n: number }>(`SELECT n FROM "${schema}".log ORDER BY n`);
     expect(rows.map((r) => r.n)).toEqual([1, 2, 3]);
+  });
+
+  it("withWriteTx bounds lock waits and statements (SET LOCAL); withTx leaves the defaults", async () => {
+    const show = (c: pg.PoolClient) =>
+      c.query<{ l: string; s: string }>(
+        "SELECT current_setting('lock_timeout') AS l, current_setting('statement_timeout') AS s",
+      ).then((r) => r.rows[0]!);
+    expect(await withWriteTx(shared, `${prefix}_bounds`, show)).toEqual({ l: "30s", s: "1min" });
+    expect(await withTx(shared, show)).toEqual({ l: "0", s: "0" });
   });
 
   it("two concurrent migration runs on one new schema both succeed; each version recorded once", async () => {

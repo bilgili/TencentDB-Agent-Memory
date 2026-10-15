@@ -2,10 +2,13 @@
  * Per-instance schema naming.
  *
  * `pgSchemaName` is the only owner of the instance-id → schema rule:
- *   - an id already in `[a-z0-9_]` that fits 63 bytes is used as is;
+ *   - an id already in `[a-z0-9_]` that fits 63 bytes and does not end in
+ *     `_` + 10 hex chars is used as is;
  *   - otherwise the id is lowercased, every char outside `[a-z0-9_]` becomes
  *     `_`, the result is truncated, and `_` + 10 hex chars of sha256(original
  *     id) is appended, so two different ids never share a name.
+ * Every hashed name ends in `_<10 hex>` and no pass-through name does, so a
+ * pass-through id can never equal another id's hashed name.
  */
 
 import { createHash } from "node:crypto";
@@ -18,6 +21,8 @@ export const DEFAULT_SCHEMA_PREFIX = "tdai";
 const MAX_IDENT_BYTES = 63;
 const HASH_HEX_CHARS = 10;
 const PREFIX_RE = /^[a-z_][a-z0-9_]{0,15}$/;
+/** The suffix of every hashed name; a pass-through id must not end in it. */
+const HASHED_SUFFIX_RE = /_[0-9a-f]{10}$/;
 
 /**
  * Throw unless `prefix` is a usable schema prefix. The error names
@@ -45,7 +50,11 @@ export function pgSchemaName(kind: PgSchemaKind, instanceId: string, prefix: str
   const base = `${prefix}_${kind}_`;
   const normalized = instanceId.toLowerCase().replace(/[^a-z0-9_]/g, "_");
   // After normalization the name is ASCII, so length === byte length.
-  if (normalized === instanceId && base.length + normalized.length <= MAX_IDENT_BYTES) {
+  if (
+    normalized === instanceId &&
+    base.length + normalized.length <= MAX_IDENT_BYTES &&
+    !HASHED_SUFFIX_RE.test(instanceId)
+  ) {
     return base + normalized;
   }
   const hash = createHash("sha256").update(instanceId, "utf8").digest("hex").slice(0, HASH_HEX_CHARS);

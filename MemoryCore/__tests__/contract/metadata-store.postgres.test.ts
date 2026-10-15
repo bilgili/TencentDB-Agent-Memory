@@ -80,7 +80,7 @@ describe("metadata store config: postgres (no database needed)", () => {
 describePg("PostgresMetadataStore", () => {
   const prefix = randomSchemaPrefix();
   const registry = new PgPoolRegistry();
-  const pool = () => registry.get(TEST_POSTGRES_URL!, 10);
+  const pool = () => registry.get("meta", TEST_POSTGRES_URL!, 10);
   let n = 0;
   const open = () => new PostgresMetadataStore({ pool: pool(), schema: pgSchemaName("meta", `c${n++}`, prefix), logger: silent });
 
@@ -146,6 +146,24 @@ describePg("PostgresMetadataStore", () => {
     a.close();
     await expect(a.countUsers()).rejects.toThrow(/closed/);
     expect(await b.countUsers()).toBe(0);
+  });
+
+  it("a cached store whose schema another process dropped re-inits and retries once", async () => {
+    const schema = pgSchemaName("meta", `c${n++}`, prefix);
+    const a = new PostgresMetadataStore({ pool: pool(), schema, logger: silent });
+    const b = new PostgresMetadataStore({ pool: pool(), schema, logger: silent });
+    await a.createUser({ auth_provider: "local", external_id: "x", username: "x" });
+    expect(await b.countUsers()).toBe(1);
+    // Another gateway's /v3 destroy: a third connection drops the schema.
+    await withTestClient((c) => c.query(`DROP SCHEMA "${schema}" CASCADE`));
+    // Plain statement path: fresh empty schema.
+    expect(await b.countUsers()).toBe(0);
+    await withTestClient((c) => c.query(`DROP SCHEMA "${schema}" CASCADE`));
+    // Transaction path (createUser runs in `tx`).
+    await a.createUser({ auth_provider: "local", external_id: "y", username: "y" });
+    expect(await b.countUsers()).toBe(1);
+    a.close();
+    b.close();
   });
 
   it("MetadataStorePool: postgres config → PostgresMetadataStore; purge drops only that instance schema", async () => {

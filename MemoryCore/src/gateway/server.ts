@@ -913,17 +913,17 @@ export class TdaiGateway {
       this.metadataStorePool = null;
       this.logger.info("Metadata Store Pool closed");
     }
-    // Postgres pools are shared by StorePool and MetadataStorePool (one per URL):
-    // end them once, after both store pools are closed.
-    await getSharedPgPoolRegistry().endAll();
-
     if (this.analyticsChClientInstance) {
       await this.analyticsChClientInstance.close().catch(() => {});
       this.analyticsChClientInstance = null;
       this.logger.info?.("Analytics CH client closed");
     }
 
+    // core.destroy() drains deferred writes, which may still use a Postgres pool.
     await this.core.destroy();
+    // Postgres pools are shared process-wide (one per owner and URL): end them
+    // once, last — after both store pools are closed and the core has drained.
+    await getSharedPgPoolRegistry().endAll();
     this.logger.info("Gateway stopped");
   }
 

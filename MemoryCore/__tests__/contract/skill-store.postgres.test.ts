@@ -13,6 +13,7 @@ import { runSkillStoreContract } from "../../src/core/skill/__contract__/skill-s
 import { SkillStoreError, type ISkillStore } from "../../src/core/skill/skill-store.interface.js";
 import type { AppendVersionInput } from "../../src/core/skill/types.js";
 import { isUniqueViolation } from "../../src/core/store/errors.js";
+import { withWriteTx } from "../../src/core/store/postgres/tx.js";
 import { StorePool } from "../../src/core/store/store-pool.js";
 import { parseConfig } from "../../src/config.js";
 import { describePg, dropSchemasWithPrefix, randomSchemaPrefix, TEST_POSTGRES_URL, withTestClient } from "../helpers/postgres.js";
@@ -23,7 +24,7 @@ const silent = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {
 describePg("PostgresSkillStore", () => {
   const prefix = randomSchemaPrefix();
   const registry = new PgPoolRegistry();
-  const pool = () => registry.get(TEST_POSTGRES_URL!, 10);
+  const pool = () => registry.get("store", TEST_POSTGRES_URL!, 10);
   let n = 0;
   const newSchema = () => pgSchemaName("mem", `s${n++}`, prefix);
   const schemaOf = new WeakMap<ISkillStore, string>();
@@ -235,6 +236,30 @@ describePg("PostgresSkillStore", () => {
     expect(await store.deleteVersion("ttl", 2)).toBe(false);
     expect(await store.deleteVersion("ttl", 1)).toBe(true);
     expect(await store.countVersions("ttl")).toBe(1);
+  });
+
+  it("deleteVersion waits for the per-skill lock (serialized with append/archive)", async () => {
+    const schema = newSchema();
+    const store = await open(schema);
+    await store.appendVersion(input("lk", "v1"));
+    await store.appendVersion(input("lk", "v2"));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const lockTaken = new Promise<void>((r) => (locked = r));
+    // Another writer of the same skill holds its lock (same key as withSkillTx).
+    const holder = withWriteTx(pool(), `${schema}/skills/lk`, async () => {
+      locked();
+      await held;
+    });
+    await lockTaken;
+    let done = false;
+    const del = store.deleteVersion("lk", 1).then((r) => ((done = true), r));
+    await new Promise((r) => setTimeout(r, 300));
+    expect(done).toBe(false);
+    release();
+    await holder;
+    expect(await del).toBe(true);
   });
 
   it("vectors follow the stored dimension; a mismatch disables them without dropping", async () => {

@@ -199,7 +199,7 @@ export async function createMetadataStore(
       const { PostgresMetadataStore } = await import("./postgres-adapter.js");
       const { getSharedPgPoolRegistry } = await import("../../core/store/postgres/pool-registry.js");
       const store = new PostgresMetadataStore({
-        pool: getSharedPgPoolRegistry().get(pg.url, pg.poolMax),
+        pool: getSharedPgPoolRegistry().get("meta", pg.url, pg.poolMax),
         schema: pgSchemaName("meta", instanceId, pg.schemaPrefix),
       });
       await store.init();
@@ -327,7 +327,7 @@ export class MetadataStorePool {
       const schema = pgSchemaName("meta", instanceId, pg.schemaPrefix);
       await this.evict(instanceId);
       const { getSharedPgPoolRegistry } = await import("../../core/store/postgres/pool-registry.js");
-      await withMigrationTx(getSharedPgPoolRegistry().get(pg.url, pg.poolMax), schema, (c) =>
+      await withMigrationTx(getSharedPgPoolRegistry().get("meta", pg.url, pg.poolMax), schema, (c) =>
         c.query(`DROP SCHEMA IF EXISTS ${quoteIdent(schema)} CASCADE`),
       );
       await this.evict(instanceId);

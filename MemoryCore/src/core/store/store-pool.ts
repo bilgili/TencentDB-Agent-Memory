@@ -397,7 +397,7 @@ export class StorePool {
       case "postgres":
         // Same shared pool and mem schema as the memory store.
         store = new PostgresSkillStore({
-          pool: getSharedPgPoolRegistry(this.logger as StoreLogger).get(db.conn.url, db.conn.poolMax),
+          pool: getSharedPgPoolRegistry(this.logger as StoreLogger).get("store", db.conn.url, db.conn.poolMax),
           schema: db.conn.schema,
           dimensions: this.memoryCfg.embedding.dimensions ?? 0,
           logger: this.logger as StoreLogger,
@@ -514,10 +514,10 @@ export class StorePool {
   // Internal — Postgres Store
   // ════════════════════════════════════════════════════════
 
-  /** One shared pg.Pool per URL; the store owns its schema, never the pool. */
+  /** One shared "store" pg.Pool per URL; the store owns its schema, never the pool. */
   private createPostgresStore(conn: PostgresConfig): PooledStore {
     const store = new PostgresMemoryStore({
-      pool: getSharedPgPoolRegistry(this.logger as StoreLogger).get(conn.url, conn.poolMax),
+      pool: getSharedPgPoolRegistry(this.logger as StoreLogger).get("store", conn.url, conn.poolMax),
       schema: conn.schema,
       dimensions: this.memoryCfg.embedding.dimensions ?? 0,
       logger: this.logger as StoreLogger,

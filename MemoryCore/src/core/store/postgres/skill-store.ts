@@ -20,7 +20,7 @@
  *   partial unique index is the second guard (HEAD_INDEX). Errors pass through
  *   unchanged (decision Q3); a lost demote throws the existing
  *   `SKILL_VERSION_STALE` store error.
- * - `appendVersion`, `archiveHead` and `deleteAllVersions` take one advisory
+ * - `appendVersion`, `archiveHead`, `deleteVersion` and `deleteAllVersions` take one advisory
  *   lock per skill (`withWriteTx` keyed by schema + skill_id). The model treats
  *   archive and delete as atomic steps; under READ COMMITTED a statement that
  *   waits on a row lock does not see rows inserted by the lock holder, so
@@ -292,7 +292,7 @@ export class PostgresSkillStore implements ISkillStore {
     return true;
   }
 
-  /** One writer per skill (see header): append, archive and delete-all serialize per skill_id. */
+  /** One writer per skill (see header): append, archive, delete-version and delete-all serialize per skill_id. */
   private withSkillTx<T>(skillId: string, fn: (client: TxClient) => Promise<T>): Promise<T> {
     return withWriteTx(this.pool, `${this.schema}/skills/${skillId}`, fn);
   }
@@ -385,9 +385,9 @@ export class PostgresSkillStore implements ISkillStore {
 
   async deleteVersion(skillId: string, version: number): Promise<boolean> {
     if (!(await this.open())) return false;
-    const r = await this.q(
-      `DELETE FROM ${this.s}.skills WHERE skill_id = $1 AND version = $2 AND NOT is_head`,
-      [skillId, version],
+    // Under the per-skill lock, so it never races appendVersion's head move.
+    const r = await this.withSkillTx(skillId, (client) =>
+      this.q(`DELETE FROM ${this.s}.skills WHERE skill_id = $1 AND version = $2 AND NOT is_head`, [skillId, version], client),
     );
     return (r.rowCount ?? 0) > 0;
   }

@@ -154,8 +154,9 @@ print_endpoints() {
 # ═══════════════════════════════════════════════════════════════
 
 # redact_url <url>：把 URL 里的密码替换为 ****，用于日志输出。
+#   密码可能含 @：贪婪匹配到 host 前的最后一个 @（authority 在第一个 / ? # 处结束）。
 redact_url() {
-  printf '%s' "$1" | sed -E 's#(://[^:/@]+):[^@]*@#\1:****@#'
+  printf '%s' "$1" | sed -E 's|(://[^:/@]+):[^/?#]*@|\1:****@|'
 }
 
 # ensure_postgres_url
@@ -383,7 +384,8 @@ set_env_value() {
   local key="$1" value="$2" file="$3"
   if grep -qE "^[[:space:]]*${key}=" "$file"; then
     local tmp="$file.tmp.$$"
-    awk -v k="$key" -v v="$value" '
+    # .env 含密钥：临时文件先复制原文件（cp -p 保留权限位），再覆写内容，mv 后权限不变。
+    cp -p "$file" "$tmp" && awk -v k="$key" -v v="$value" '
       $0 ~ ("^[[:space:]]*" k "=") { print k "=" v; next }
       { print }
     ' "$file" > "$tmp" && mv "$tmp" "$file"

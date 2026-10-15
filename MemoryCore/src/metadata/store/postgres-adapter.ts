@@ -9,7 +9,9 @@
  * - The pool comes from the shared `PgPoolRegistry`; `close()` never ends it.
  * - `_ensureInit()` gates every data call; a failed init resets the
  *   promise so the next call retries. Statements inside a transaction already
- *   passed the gate when the transaction started.
+ *   passed the gate when the transaction started. A statement or transaction
+ *   that finds the schema dropped (3F000/42P01, another gateway's /v3 destroy)
+ *   resets the gate, re-inits and retries once (`run`).
  * - Tables are versioned migrations ported from the SQLite `createSchema()`.
  *   Time columns stay ISO-8601 text (the entities expose strings) with
  *   `COLLATE "C"`, so ORDER BY / range filters match SQLite byte order.
@@ -366,6 +368,16 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * The schema or a table is gone: `3F000` invalid_schema_name, `42P01`
+ * undefined_table. Seen after another gateway's /v3 destroy dropped the schema
+ * while this process still has the store cached as initialised.
+ */
+function isSchemaGone(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return code === "3F000" || code === "42P01";
+}
+
 function isPkCollision(err: unknown, table: Table): boolean {
   return isUniqueViolation(err, `${table}_pkey`);
 }
@@ -463,12 +475,36 @@ export class PostgresMetadataStore implements IMetadataStore {
     if (applied.length > 0) this.logger?.info(`${TAG} ${this.schema}: applied migrations ${applied.join(",")}`);
   }
 
+  /**
+   * Every pool-level operation goes through here: wait for the init gate, run
+   * `op`; if the schema was dropped under a cached store (another gateway's
+   * /v3 destroy), reset the gate, re-run init (migrations recreate an empty
+   * schema, as a fresh store would) and retry `op` once. `op` is one statement
+   * or one whole transaction (rolled back on the error), so a retry is safe.
+   */
+  private async run<T>(op: () => Promise<T>): Promise<T> {
+    await this._ensureInit();
+    try {
+      return await op();
+    } catch (err) {
+      if (!isSchemaGone(err)) throw err;
+      this.logger?.warn(`${TAG} ${this.schema} is gone (${errMsg(err)}); re-initialising and retrying once`);
+      // Only the first failing caller resets; others join the init it started.
+      if (this.ready) {
+        this.ready = false;
+        this.initPromise = null;
+      }
+      await this._ensureInit();
+      return op();
+    }
+  }
+
   // ── Query helpers ───────────────────────────────────────
 
   /** Rows of one statement. Without `c` the call waits for the init gate. */
   private async q<R extends Row = Row>(sql: string, params: unknown[] = [], c?: Queryable): Promise<R[]> {
-    if (!c) await this._ensureInit();
-    return (await (c ?? this.pool).query<R>(sql, params)).rows;
+    if (c) return (await c.query<R>(sql, params)).rows;
+    return this.run(async () => (await this.pool.query<R>(sql, params)).rows);
   }
 
   private async one<R extends Row = Row>(sql: string, params: unknown[] = [], c?: Queryable): Promise<R | null> {
@@ -477,19 +513,17 @@ export class PostgresMetadataStore implements IMetadataStore {
 
   /** Affected-row count of one statement. */
   private async exec(sql: string, params: unknown[] = [], c?: Queryable): Promise<number> {
-    if (!c) await this._ensureInit();
-    return (await (c ?? this.pool).query(sql, params)).rowCount ?? 0;
+    if (c) return (await c.query(sql, params)).rowCount ?? 0;
+    return this.run(async () => (await this.pool.query(sql, params)).rowCount ?? 0);
   }
 
-  private async tx<T>(fn: (c: TxClient) => Promise<T>): Promise<T> {
-    await this._ensureInit();
-    return withTx(this.pool, fn);
+  private tx<T>(fn: (c: TxClient) => Promise<T>): Promise<T> {
+    return this.run(() => withTx(this.pool, fn));
   }
 
   /** One writer per schema: former `BEGIN IMMEDIATE` sites and set-checking writes. */
-  private async writeTx<T>(fn: (c: TxClient) => Promise<T>): Promise<T> {
-    await this._ensureInit();
-    return withWriteTx(this.pool, this.schema, fn);
+  private writeTx<T>(fn: (c: TxClient) => Promise<T>): Promise<T> {
+    return this.run(() => withWriteTx(this.pool, this.schema, fn));
   }
 
   private async selectList<T>(

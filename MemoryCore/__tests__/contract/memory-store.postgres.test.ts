@@ -15,6 +15,7 @@ import type { IMemoryStore } from "../../src/core/store/types.js";
 import type { MemoryRecord } from "../../src/core/record/l1-writer.js";
 import { buildFtsQuery } from "../../src/core/store/tokenize.js";
 import { StorePool } from "../../src/core/store/store-pool.js";
+import { createStoreBundle } from "../../src/core/store/factory.js";
 import { parseConfig } from "../../src/config.js";
 import { describePg, dropSchemasWithPrefix, randomSchemaPrefix, TEST_POSTGRES_URL, withTestClient } from "../helpers/postgres.js";
 
@@ -24,7 +25,7 @@ const silent = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {
 describePg("PostgresMemoryStore", () => {
   const prefix = randomSchemaPrefix();
   const registry = new PgPoolRegistry();
-  const pool = () => registry.get(TEST_POSTGRES_URL!, 10);
+  const pool = () => registry.get("store", TEST_POSTGRES_URL!, 10);
   let n = 0;
   const newSchema = () => pgSchemaName("mem", `c${n++}`, prefix);
   const schemaOf = new WeakMap<IMemoryStore, string>();
@@ -174,6 +175,39 @@ describePg("PostgresMemoryStore", () => {
     } finally {
       await own.end();
       await withTestClient((c) => c.query(`DROP DATABASE ${db} WITH (FORCE)`));
+    }
+  });
+
+  it("createStoreBundle(postgres) without memory.postgres falls back to POSTGRES_* env; config wins over env", async () => {
+    vi.stubEnv("POSTGRES_URL", TEST_POSTGRES_URL!);
+    vi.stubEnv("POSTGRES_SCHEMA_PREFIX", prefix);
+    vi.stubEnv("POSTGRES_POOL_MAX", "3");
+    try {
+      // Deploy-script shape: storeBackend only, no memory.postgres block.
+      const bundle = createStoreBundle(
+        parseConfig({ storeBackend: "postgres", embedding: { dimensions: DIMS } }),
+        { dataDir: ".", logger: silent },
+      );
+      expect(bundle.store).toBeInstanceOf(PostgresMemoryStore);
+      const schema = pgSchemaName("mem", "default", prefix);
+      expect(bundle.storeSnapshot).toMatchObject({ type: "postgres", postgresSchema: schema });
+      await bundle.store.init();
+      expect(await bundle.store.countL0()).toBe(0);
+      bundle.store.close();
+
+      const fromConfig = createStoreBundle(
+        parseConfig({
+          storeBackend: "postgres",
+          postgres: { url: "postgres://cfg:pw@cfg-host:5432/cfgdb", schemaPrefix: "cfgp" },
+          embedding: { dimensions: DIMS },
+        }),
+        { dataDir: ".", logger: silent },
+      );
+      expect(fromConfig.storeSnapshot).toMatchObject({ postgresSchema: "cfgp_mem_default" });
+      expect(String((fromConfig.storeSnapshot as { postgresUrl?: string }).postgresUrl)).toContain("cfg-host");
+      fromConfig.store.close();
+    } finally {
+      await getSharedPgPoolRegistry().endAll();
     }
   });
 

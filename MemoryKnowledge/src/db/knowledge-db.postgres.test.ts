@@ -54,6 +54,32 @@ describe.skipIf(!TEST_POSTGRES_URL)("knowledge DB on Postgres (TEST_POSTGRES_URL
     expect(quiet).not.toHaveBeenCalled();
   });
 
+  it("a failed heartbeat on the lock connection calls the fail-stop hook once", async () => {
+    const onLockLost = vi.fn<(err: Error) => void>();
+    const kdb = await openPg(randomSchema(), { onLockLost, lockHeartbeatMs: 20 });
+    try {
+      // A connection that no longer answers: the heartbeat query rejects.
+      vi.spyOn(kdb.lockClient, "query").mockRejectedValue(new Error("heartbeat failed"));
+      await vi.waitFor(() => expect(onLockLost).toHaveBeenCalledTimes(1));
+      expect(onLockLost.mock.calls[0]![0].message).toBe("heartbeat failed");
+      await new Promise((r) => setTimeout(r, 60));
+      expect(onLockLost).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.restoreAllMocks();
+      await kdb.close();
+    }
+  });
+
+  it("close() ends the pool before the lock client (no write after the lock is released)", async () => {
+    const kdb = await openPg(randomSchema());
+    const poolEnd = vi.spyOn(kdb.pool, "end");
+    const lockEnd = vi.spyOn(kdb.lockClient, "end");
+    await kdb.close();
+    expect(poolEnd).toHaveBeenCalledTimes(1);
+    expect(lockEnd).toHaveBeenCalledTimes(1);
+    expect(poolEnd.mock.invocationCallOrder[0]!).toBeLessThan(lockEnd.mock.invocationCallOrder[0]!);
+  });
+
   it("concurrent migrations of one new schema run one after the other", async () => {
     const kdb = await openPg(randomSchema());
     try {

@@ -175,7 +175,7 @@ export async function createApp(opts: CreateKnowledgeDbOptions = {}) {
 }
 
 async function startServer(): Promise<void> {
-  const { app, config, knowledgeTelemetry, knowledgeDb } = await createApp();
+  const { app, config, knowledgeModule, knowledgeTelemetry, knowledgeDb } = await createApp();
   await knowledgeTelemetry.initialize();
 
   log.info(`Starting knowledge service on port ${config.port}`);
@@ -203,7 +203,11 @@ async function startServer(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     log.info(`Received ${signal}, shutting down`);
-    await knowledgeTelemetry.shutdown();
+    // No new sync runs may start once the DB is closing.
+    knowledgeModule.autoSyncScheduler.stop();
+    await knowledgeTelemetry.shutdown().catch((err: unknown) => {
+      log.warn("telemetry shutdown failed", { error: err instanceof Error ? err.message : String(err) });
+    });
     // HTTP first, then the DB (pool + schema lock); a clean lock-client end is not a lock loss.
     server.close(() => void knowledgeDb.close().finally(() => process.exit(0)));
   };

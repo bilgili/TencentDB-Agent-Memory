@@ -100,7 +100,16 @@ export interface CreateKnowledgeDbOptions {
    * fail-stop. Tests inject a spy.
    */
   onLockLost?: (err: Error) => void;
+  /**
+   * Interval of the `SELECT 1` heartbeat on the lock connection. A failed
+   * heartbeat counts as a lost lock. Default 30s; tests inject a short one.
+   */
+  lockHeartbeatMs?: number;
 }
+
+const LOCK_HEARTBEAT_MS = 30_000;
+/** A heartbeat on a half-open connection would otherwise hang instead of failing. */
+const LOCK_QUERY_TIMEOUT_MS = 10_000;
 
 /**
  * Open the central DB. On Postgres this also takes the schema lock
@@ -141,12 +150,16 @@ export async function createKnowledgeDb(
 
   // step 2: session lock on a dedicated client, never a pooled one (the pool
   // closes idle clients, which would release the lock).
-  const lockClient = new pg.Client({ connectionString: url });
+  // keepAlive + the heartbeat below detect a silently dead connection (the lock
+  // is gone with it) instead of waiting for the next write to fail.
+  const lockClient = new pg.Client({ connectionString: url, keepAlive: true, query_timeout: LOCK_QUERY_TIMEOUT_MS });
   let armed = false;
   let closing = false;
+  let heartbeat: NodeJS.Timeout | undefined;
   const lost = (err?: Error) => {
     if (!armed || closing) return;
     armed = false;
+    clearInterval(heartbeat);
     onLockLost(err ?? new Error("lock connection ended"));
   };
   lockClient.on("error", lost);
@@ -170,6 +183,10 @@ export async function createKnowledgeDb(
     throw err;
   }
   armed = true;
+  heartbeat = setInterval(() => {
+    lockClient.query("SELECT 1").catch((err: unknown) => lost(err instanceof Error ? err : new Error(String(err))));
+  }, opts.lockHeartbeatMs ?? LOCK_HEARTBEAT_MS);
+  heartbeat.unref();
 
   return {
     dialect: "postgres",
@@ -180,8 +197,13 @@ export async function createKnowledgeDb(
     lockClient,
     async close() {
       closing = true;
-      await lockClient.end().catch(() => undefined); // ends the session → releases the lock
-      await pool.end();
+      clearInterval(heartbeat);
+      // Pool first: no write may run after the lock is released.
+      try {
+        await pool.end();
+      } finally {
+        await lockClient.end().catch(() => undefined); // ends the session → releases the lock
+      }
     },
   };
 }

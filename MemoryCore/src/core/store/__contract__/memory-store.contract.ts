@@ -6,7 +6,10 @@
  * knows how to create/dispose an isolated store for one backend, then calls
  * `runMemoryStoreContract(harness)`.
  *
- * Scope (Phase-1 keyword-only surface — no vector assertions):
+ * Vector cases (nearest-first, 1% filter, dimension change, no-vector mode)
+ * run only when the harness sets `vectorDimensions` — see runVectorCases.
+ *
+ * Scope (keyword surface):
  *   - lifecycle + capability shape
  *   - L0 write/read/count + session query
  *   - L1 write/read/count + delete
@@ -27,12 +30,30 @@ import { isProfileRowStore } from "../profile-row-store.js";
 export interface MemoryStoreContractHarness {
   /** Human-readable backend label used in test titles. */
   backend: string;
-  /** Create a fresh, isolated (unique namespace/db/dir) store and init it. */
-  createStore(): Promise<IMemoryStore>;
+  /**
+   * Create a fresh, isolated (unique namespace/db/dir) store and init it.
+   * `dimensions` overrides the harness default embedding dimension
+   * (0 = no vector support, used by the degraded-mode case).
+   */
+  createStore(opts?: { dimensions?: number }): Promise<IMemoryStore>;
+  /**
+   * Close `store` and open the SAME namespace again with another embedding
+   * dimension (dimension-mismatch case). Omit to skip that case.
+   */
+  reopenStore?(store: IMemoryStore, opts: { dimensions: number }): Promise<IMemoryStore>;
   /** Dispose the store + any underlying resources (files, connections). */
   disposeStore(store: IMemoryStore): Promise<void>;
   /** When true, FTS results are eventually consistent → search assertions poll. */
   ftsEventuallyConsistent?: boolean;
+  /** Default embedding dimension of `createStore()`. Vector cases skip when 0/absent. */
+  vectorDimensions?: number;
+  /**
+   * True when a filtered vector search returns up to topK matching rows however
+   * selective the filter is (filter applied inside the index scan). SQLite
+   * over-fetches max(topK*5, topK+10) candidates and filters afterwards, so a
+   * selective filter far from the query can return fewer rows: it sets false.
+   */
+  filteredVectorSearchExact?: boolean;
 }
 
 const now = () => new Date().toISOString();
@@ -386,6 +407,118 @@ export function runMemoryStoreContract(harness: MemoryStoreContractHarness): voi
         // promise (mongo) both surface as a rejection for `.rejects`.
         await expect((async () => clear({ teamId: "", agentId: "agent-x" }))()).rejects.toThrow();
         await expect((async () => clear({ teamId: "team-x", agentId: "" }))()).rejects.toThrow();
+      } finally {
+        await harness.disposeStore(store);
+      }
+    });
+  });
+
+  runVectorCases(harness);
+}
+
+/** Unit-ish vector: `main` on axis `axis`, `jitter` on the next axis (distinct, stable order). */
+function vec(dims: number, axis: number, jitter = 0): Float32Array {
+  const v = new Float32Array(dims);
+  v[axis % dims] = 1;
+  v[(axis + 1) % dims] = jitter;
+  return v;
+}
+
+function expectScoresDescending(rows: Array<{ score: number }>): void {
+  for (let i = 1; i < rows.length; i++) {
+    expect(rows[i - 1].score).toBeGreaterThanOrEqual(rows[i].score);
+  }
+}
+
+/**
+ * Vector cases. Skipped when the harness has no
+ * vector dimension or the store reports no vector capability.
+ */
+function runVectorCases(harness: MemoryStoreContractHarness): void {
+  const dims = harness.vectorDimensions ?? 0;
+
+  describe.skipIf(dims < 4)(`IMemoryStore vector contract [${harness.backend}]`, () => {
+    it("L1 vector search returns the nearest record first, scores descending", async () => {
+      const store = await harness.createStore();
+      try {
+        expect(store.getCapabilities().vectorSearch).toBe(true);
+        await store.upsertL1(makeL1("v-0", "axis zero"), vec(dims, 0));
+        await store.upsertL1(makeL1("v-1", "axis one"), vec(dims, 1));
+        await store.upsertL1(makeL1("v-2", "axis two"), vec(dims, 2));
+
+        const hits = await store.searchL1Vector(vec(dims, 1, 0.1), 3);
+        expect(hits[0]?.record_id).toBe("v-1");
+        expect(hits.map((h) => h.record_id).sort()).toEqual(["v-0", "v-1", "v-2"]);
+        expectScoresDescending(hits);
+      } finally {
+        await harness.disposeStore(store);
+      }
+    });
+
+    it("filtered L1 vector search returns only matching rows (1% filter)", async () => {
+      const store = await harness.createStore();
+      try {
+        // 990 non-matching rows sit right next to the query; the 10 matching
+        // (team-a) rows sit on an orthogonal axis, far from it.
+        for (let i = 0; i < 990; i++) {
+          await store.upsertL1(
+            makeL1(`far-${i}`, "noise", { teamId: "team-b", agentId: "agent-a" } as Partial<MemoryRecord>),
+            vec(dims, 0, i / 1000),
+          );
+        }
+        for (let i = 0; i < 10; i++) {
+          await store.upsertL1(
+            makeL1(`hit-${i}`, "signal", { teamId: "team-a", agentId: "agent-a" } as Partial<MemoryRecord>),
+            vec(dims, 2, i / 100),
+          );
+        }
+
+        const filter = { teamId: "team-a", agentId: "agent-a" };
+        const hits = await store.searchL1Vector(vec(dims, 0), 5, undefined, filter);
+
+        expect(hits.length).toBeLessThanOrEqual(5);
+        expect(hits.every((h) => h.record_id.startsWith("hit-"))).toBe(true);
+        expectScoresDescending(hits);
+        if (harness.filteredVectorSearchExact) {
+          expect(hits.length).toBe(5);
+        }
+      } finally {
+        await harness.disposeStore(store);
+      }
+    });
+
+    it.skipIf(!harness.reopenStore)(
+      "dimension change never serves vectors of the old dimension; rows survive",
+      async () => {
+        let store = await harness.createStore();
+        try {
+          await store.upsertL1(makeL1("d-0", "dimension change keeps this row"), vec(dims, 0));
+          await store.upsertL1(makeL1("d-1", "and this one"), vec(dims, 1));
+
+          const newDims = dims / 2;
+          store = await harness.reopenStore!(store, { dimensions: newDims });
+
+          expect(store.isDegraded()).toBe(false);
+          expect(await store.countL1()).toBe(2);
+          // SQLite rebuilds the vector tables empty; Postgres keeps them and
+          // reports vectorSearch=false. Either way: no stale hits, no throw.
+          expect(await store.searchL1Vector(vec(newDims, 0), 5)).toEqual([]);
+        } finally {
+          await harness.disposeStore(store);
+        }
+      },
+    );
+
+    it("store without vector support: vector search empty, keyword search works", async () => {
+      const store = await harness.createStore({ dimensions: 0 });
+      try {
+        expect(store.isDegraded()).toBe(false);
+        expect(store.getCapabilities().vectorSearch).toBe(false);
+        expect(await store.upsertL1(makeL1("nv-ts", "User writes primarily TypeScript"))).toBe(true);
+
+        expect(await store.searchL1Vector(vec(dims, 0), 5)).toEqual([]);
+        const hits = await store.searchL1Fts(fts("TypeScript"), 10);
+        expect(hits.some((r) => r.record_id === "nv-ts")).toBe(true);
       } finally {
         await harness.disposeStore(store);
       }

@@ -1,0 +1,23 @@
+# Local Postgres + pgvector for the Postgres contract tests.
+#
+#   docker compose -f deploy/test/postgres.yaml up -d --wait
+#   export TEST_POSTGRES_URL=postgres://tdai:tdai@127.0.0.1:55432/tdai_test
+#
+# Tests create and drop their own random-prefixed schemas. No named volume,
+# so `down` leaves nothing behind.
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.0-pg17
+    environment:
+      POSTGRES_USER: tdai
+      POSTGRES_PASSWORD: tdai
+      POSTGRES_DB: tdai_test
+      # UTF-8 locale: the `simple` text-search parser needs it to split CJK text.
+      POSTGRES_INITDB_ARGS: "--locale=C.UTF-8 --encoding=UTF8"
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tdai -d tdai_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

@@ -22,8 +22,10 @@ fi
 MEMORY_CORE_VOLUME="${MEMORY_CORE_VOLUME:-tdai-memory-core-data}"
 PANEL_VOLUME="${PANEL_VOLUME:-tdai-panel-data}"
 MONGO_LOCAL_CONTAINER="${MONGO_LOCAL_CONTAINER:-tdai-mongo-local}"
+POSTGRES_LOCAL_CONTAINER="${POSTGRES_LOCAL_CONTAINER:-tdai-postgres-local}"
+POSTGRES_LOCAL_VOLUME="${POSTGRES_LOCAL_VOLUME:-postgres-local-data}"
 
-for c in tdai-proxy tdai-memory-hub tdai-memory-core "$MONGO_LOCAL_CONTAINER"; do
+for c in tdai-proxy tdai-memory-hub tdai-memory-core "$MONGO_LOCAL_CONTAINER" "$POSTGRES_LOCAL_CONTAINER"; do
   if $DOCKER ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then
     info "停止并移除 $c"
     $DOCKER rm -f "$c" >/dev/null
@@ -34,7 +36,7 @@ done
 
 if (( PURGE == 1 )); then
   warn "--purge 已启用：删除 volume + 网络 + admin key 文件"
-  for v in "$MEMORY_CORE_VOLUME" "$PANEL_VOLUME" mongo-local-db mongo-local-configdb mongo-local-mongot; do
+  for v in "$MEMORY_CORE_VOLUME" "$PANEL_VOLUME" mongo-local-db mongo-local-configdb mongo-local-mongot "$POSTGRES_LOCAL_VOLUME"; do
     if $DOCKER volume inspect "$v" >/dev/null 2>&1; then
       $DOCKER volume rm "$v" >/dev/null && ok "已删除 volume $v" || warn "删除 volume $v 失败"
     fi

@@ -83,6 +83,26 @@ if ! $DOCKER ps --format '{{.Names}}' 2>/dev/null | grep -qx "tdai-memory-core";
   warn "建议先 ./start-memory-core.sh 再来这里，或直接 ./start-all.sh"
 fi
 
+# ── knowledge 存储后端：sqlite（默认）/ postgres（试验特性）──────────────
+# KNOWLEDGE_DB_URL 已设（postgres:// 或 postgresql://）→ 原样使用；
+# 否则 MEMORY_CORE_STORE_MODE=postgres 时跟随 memory-core，复用同一个 Postgres，
+#   但落在独立 schema（KNOWLEDGE_DB_SCHEMA，默认 knowledge，不能是 public）；
+# 都不满足 → 不传 KNOWLEDGE_DB_URL，knowledge 继续用容器卷里的 SQLite（KNOWLEDGE_DB_PATH）。
+# 注意：每个 Postgres schema 只允许一个 memory-hub 进程（advisory lock，第二个会退出）；
+#       PgBouncer 事务模式不支持。
+PG_ENV_ARGS=()
+if [[ -z "${KNOWLEDGE_DB_URL:-}" && "${MEMORY_CORE_STORE_MODE:-sqlite}" == "postgres" ]]; then
+  ensure_postgres_url
+  KNOWLEDGE_DB_URL="$POSTGRES_URL"
+fi
+if [[ -n "${KNOWLEDGE_DB_URL:-}" ]]; then
+  PG_ENV_ARGS+=( -e "KNOWLEDGE_DB_URL=$KNOWLEDGE_DB_URL" -e "KNOWLEDGE_DB_SCHEMA=${KNOWLEDGE_DB_SCHEMA:-knowledge}" )
+  [[ -n "${KNOWLEDGE_DB_POOL_MAX:-}" ]] && PG_ENV_ARGS+=( -e "KNOWLEDGE_DB_POOL_MAX=$KNOWLEDGE_DB_POOL_MAX" )
+  info "memory-hub knowledge 后端 = postgres（url=$(redact_url "$KNOWLEDGE_DB_URL"), schema=${KNOWLEDGE_DB_SCHEMA:-knowledge}）"
+else
+  info "memory-hub knowledge 后端 = sqlite（容器 volume 内）"
+fi
+
 pull_image "$MEMORY_HUB_IMAGE"
 rm_container_if_exists "$CONTAINER"
 
@@ -112,6 +132,7 @@ $DOCKER run -d --name "$CONTAINER" \
   -e LLM_BASE_URL="$MEMORY_LLM_BASE_URL" \
   -e LLM_MODEL="$MEMORY_LLM_MODEL" \
   -e KNOWLEDGE_LLM_BINDING_SYNC=0 \
+  ${PG_ENV_ARGS[@]+"${PG_ENV_ARGS[@]}"} \
   "$MEMORY_HUB_IMAGE" >/dev/null
 
 wait_healthy "$CONTAINER" 120

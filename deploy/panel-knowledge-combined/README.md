@@ -124,6 +124,74 @@ docker run -d --name memory-hub \
 | `METADATA_REMOTE_TIMEOUT_MS` | `15000` | Panel 调远端 Gateway 的请求超时 |
 | `REMOTE_INSTANCE_PROXY_URL` | 空 | Panel UI "客户端接入地址"卡片显示的 base URL。开源本地部署 core+proxy 分开跑时填 proxy 的外部地址（如 `http://host.docker.internal:8096`），Panel UI 复制的 CodeBuddy/ClaudeCode 接入地址就会指向 proxy。留空则老行为 —— UI 回落到 `gateway_endpoint`。**Panel 后端 → Kernel 的转发始终走 `REMOTE_INSTANCE_URL`，与此变量无关。**（挂载了 `metadata-instances.json` 时忽略此变量，直接在 JSON 里加 `proxy_endpoint` 字段） |
 
+### PostgreSQL backend
+
+The knowledge service in this image stores its data in SQLite by default (`KNOWLEDGE_DB_PATH`). You can store it in PostgreSQL instead. Set `KNOWLEDGE_DB_URL` and the service uses Postgres. The panel is not affected.
+
+```bash
+docker run -d --name memory-hub \
+  -e KNOWLEDGE_DB_URL="postgres://<USER>:<PASSWORD>@<HOST>:5432/<DATABASE>" \
+  -e KNOWLEDGE_DB_SCHEMA=knowledge \
+  ... \
+  agentmemory/memory-hub:latest
+```
+
+With Postgres, `KNOWLEDGE_DB_PATH` is not used. The volume `/data/knowledge` still holds the git clones, the wiki files and the logs.
+
+#### Requirements
+
+- PostgreSQL 15 or later.
+- A database with UTF-8 (Unicode Transformation Format 8-bit) encoding and a UTF-8 locale, for example `C.UTF-8` or `en_US.UTF-8`. Keyword search of Chinese, Japanese and Korean (CJK) text needs it. The store checks this at start. If the check fails, keyword search runs in degraded mode and the log shows the cause.
+- The pgvector extension, version 0.8.0 or later. The image `pgvector/pgvector:0.8.0-pg17`, or a newer image, includes it.
+
+The knowledge service has its own schema (`KNOWLEDGE_DB_SCHEMA`). It creates the schema at first start.
+
+#### One-time extension setup
+
+pgvector 0.8.0 is not a trusted extension. A role without superuser rights cannot run `CREATE EXTENSION vector`. A superuser runs this command one time for each database:
+
+```sql
+CREATE EXTENSION vector;
+```
+
+If pgvector is missing or older than 0.8.0, the stores run without vector search. The log shows the cause. Keyword search still works.
+
+#### Settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `KNOWLEDGE_DB_URL` | none | A `postgres://` or `postgresql://` URL (Uniform Resource Locator) selects Postgres. If it is not set, `KNOWLEDGE_DB_PATH` (SQLite) applies. |
+| `KNOWLEDGE_DB_SCHEMA` | `knowledge` | Schema name. The service rejects `public` and names that start with `pg_`. |
+| `KNOWLEDGE_DB_POOL_MAX` | `10` | Maximum connections in the pool. |
+
+The memory gateway uses `STORE_MODE=postgres`, `POSTGRES_URL`, `POSTGRES_SCHEMA_PREFIX`, `POSTGRES_POOL_MAX`, `TDAI_METADATA_POSTGRES_URL`, `TDAI_METADATA_POSTGRES_SCHEMA_PREFIX` and `TDAI_METADATA_POSTGRES_POOL_MAX`. The documents `README.deployment.md` and `deploy/global-images/README.md` describe them.
+
+#### Connection limit
+
+Keep this sum within the server limit:
+
+```text
+gateways × POSTGRES_POOL_MAX
+  + gateways × TDAI_METADATA_POSTGRES_POOL_MAX
+  + KNOWLEDGE_DB_POOL_MAX
+  + 1
+  ≤ max_connections − reserved connections
+```
+
+The `+ 1` is the connection that MemoryKnowledge keeps for its lock. Example: 2 gateways with the default pool sizes need 2 × 10 + 2 × 5 + 10 + 1 = 41 connections. The PostgreSQL default of `max_connections = 100` is enough for this case.
+
+#### One memory-hub process for each schema
+
+Run one MemoryKnowledge process for each Postgres schema. The process takes an advisory lock when it starts. A second process finds the lock and stops with an error. Do not start two replicas on one schema.
+
+PgBouncer in session mode is supported. PgBouncer in transaction mode is not supported for MemoryKnowledge, because it does not keep the session lock.
+
+#### Switch backends and roll back
+
+- Switching backends does not migrate data. The Postgres schema starts empty.
+- The SQLite file stays untouched on the volume.
+- To roll back, remove `KNOWLEDGE_DB_URL` and restart. The service uses the SQLite file and its earlier data again.
+
 ### TLS 证书
 
 公网正式证书一般无需额外配置。当 LLM Proxy 或 Gateway 使用 HTTPS 且证书不被容器信任时（如自签名证书、内部 CA），有两种方式解决：

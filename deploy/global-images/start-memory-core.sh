@@ -48,7 +48,7 @@ if ! $DOCKER network inspect "$NETWORK" >/dev/null 2>&1; then
   $DOCKER network create "$NETWORK" >/dev/null
 fi
 
-# ── 存储后端：sqlite（默认）/ mongodb ─────────────────────────────────────
+# ── 存储后端：sqlite（默认）/ mongodb / postgres ─────────────────────────
 # MEMORY_CORE_STORE_MODE=mongodb 时数据面走 MongoDB（L0/L1/profile/skill +
 # mongot 原生 BM25）。要求目标 Mongo 7.0+ 且带 mongot —— core 首次建连会拨测，
 # 无 mongot 直接 init 报错（FTS 是刚需，不静默降级）。
@@ -57,7 +57,7 @@ fi
 #                             （mongod + mongot 一体，数据卷 mongo-local-* 持久化）
 #
 # 元数据后端（meta_* 团队/用户/agent/task/ACL）：
-#   MEMORY_CORE_METADATA_BACKEND=auto（默认，跟随 STORE_MODE）/ sqlite / mongodb
+#   MEMORY_CORE_METADATA_BACKEND=auto（默认，跟随 STORE_MODE）/ sqlite / mongodb / postgres
 #   mongodb 时默认复用同一个 Mongo（TDAI_METADATA_MONGO_URI 可另行覆盖）；
 #   元数据用多文档事务，目标必须是副本集（atlas-local 单节点 RS 满足）。
 MEMORY_CORE_STORE_MODE="${MEMORY_CORE_STORE_MODE:-sqlite}"
@@ -66,10 +66,13 @@ MONGODB_DATABASE="${MONGODB_DATABASE:-tdai_memory}"
 MONGO_LOCAL_CONTAINER="${MONGO_LOCAL_CONTAINER:-tdai-mongo-local}"
 MONGO_LOCAL_IMAGE="${MONGO_LOCAL_IMAGE:-mongodb/mongodb-atlas-local:8.3}"
 MONGO_ENV_ARGS=()
+PG_ENV_ARGS=()
 
 if [[ "$MEMORY_CORE_METADATA_BACKEND" == "auto" ]]; then
   if [[ "$MEMORY_CORE_STORE_MODE" == "mongodb" ]]; then
     MEMORY_CORE_METADATA_BACKEND="mongodb"
+  elif [[ "$MEMORY_CORE_STORE_MODE" == "postgres" ]]; then
+    MEMORY_CORE_METADATA_BACKEND="postgres"
   else
     MEMORY_CORE_METADATA_BACKEND="sqlite"
   fi
@@ -120,8 +123,38 @@ if [[ "$MEMORY_CORE_METADATA_BACKEND" == "mongodb" ]]; then
   TDAI_METADATA_MONGO_URI="${TDAI_METADATA_MONGO_URI:-$MONGODB_ENDPOINT}"
   MONGO_ENV_ARGS+=( -e "TDAI_METADATA_MONGO_URI=$TDAI_METADATA_MONGO_URI" )
   info "memory-core 元数据后端 = mongodb（uri=$TDAI_METADATA_MONGO_URI, 库名 tdai_metadata_<instance>）"
-else
+elif [[ "$MEMORY_CORE_METADATA_BACKEND" == "sqlite" ]]; then
   info "memory-core 元数据后端 = sqlite（容器 volume 内）"
+fi
+
+# ── Postgres（试验特性）──────────────────────────────────────────────────
+# MEMORY_CORE_STORE_MODE=postgres 时数据面走 Postgres（要求 15+ 且带 pgvector >= 0.8.0）。
+#   POSTGRES_URL 已设   → 用外部 Postgres；pgvector 0.8.0 不是 trusted 扩展，
+#                         需超级用户在该库执行一次 CREATE EXTENSION vector，
+#                         否则 core 无向量检索（降级运行，不报错）；
+#   POSTGRES_URL 未设   → 自动在同网络起一个 pgvector 容器（见 _lib.sh ensure_postgres_url）。
+# 元数据后端 postgres 时默认复用同一个库（TDAI_METADATA_POSTGRES_URL 可另行覆盖）；
+# 与 TDAI_METADATA_MONGO_URI 互斥 —— 这里只会传 Postgres 那一个。
+if [[ "$MEMORY_CORE_STORE_MODE" == "postgres" || "$MEMORY_CORE_METADATA_BACKEND" == "postgres" ]]; then
+  ensure_postgres_url
+fi
+
+if [[ "$MEMORY_CORE_STORE_MODE" == "postgres" ]]; then
+  PG_ENV_ARGS+=( -e "POSTGRES_URL=$POSTGRES_URL" )
+  [[ -n "${POSTGRES_SCHEMA_PREFIX:-}" ]] && PG_ENV_ARGS+=( -e "POSTGRES_SCHEMA_PREFIX=$POSTGRES_SCHEMA_PREFIX" )
+  [[ -n "${POSTGRES_POOL_MAX:-}" ]] && PG_ENV_ARGS+=( -e "POSTGRES_POOL_MAX=$POSTGRES_POOL_MAX" )
+  info "memory-core 数据面后端 = postgres（url=$(redact_url "$POSTGRES_URL"), schema 前缀=${POSTGRES_SCHEMA_PREFIX:-tdai}）"
+fi
+
+if [[ "$MEMORY_CORE_METADATA_BACKEND" == "postgres" ]]; then
+  if [[ -n "${TDAI_METADATA_MONGO_URI:-}" ]]; then
+    warn "TDAI_METADATA_MONGO_URI 已设但元数据后端是 postgres —— 两者互斥，本脚本只传 Postgres 那一个。"
+  fi
+  TDAI_METADATA_POSTGRES_URL="${TDAI_METADATA_POSTGRES_URL:-$POSTGRES_URL}"
+  PG_ENV_ARGS+=( -e "TDAI_METADATA_POSTGRES_URL=$TDAI_METADATA_POSTGRES_URL" )
+  [[ -n "${TDAI_METADATA_POSTGRES_SCHEMA_PREFIX:-}" ]] && PG_ENV_ARGS+=( -e "TDAI_METADATA_POSTGRES_SCHEMA_PREFIX=$TDAI_METADATA_POSTGRES_SCHEMA_PREFIX" )
+  [[ -n "${TDAI_METADATA_POSTGRES_POOL_MAX:-}" ]] && PG_ENV_ARGS+=( -e "TDAI_METADATA_POSTGRES_POOL_MAX=$TDAI_METADATA_POSTGRES_POOL_MAX" )
+  info "memory-core 元数据后端 = postgres（url=$(redact_url "$TDAI_METADATA_POSTGRES_URL"), schema tdai_meta_<instance>）"
 fi
 
 # ── L3 即时更新决策（默认 current；显式启用才生成 JEV 配置）──────────────
@@ -254,6 +287,7 @@ $DOCKER run -d --name "$CONTAINER" \
   -e STORE_MODE="$MEMORY_CORE_STORE_MODE" \
   ${JEV_ENV_ARGS[@]+"${JEV_ENV_ARGS[@]}"} \
   ${MONGO_ENV_ARGS[@]+"${MONGO_ENV_ARGS[@]}"} \
+  ${PG_ENV_ARGS[@]+"${PG_ENV_ARGS[@]}"} \
   "$MEMORY_CORE_IMAGE" >/dev/null
 
 wait_healthy "$CONTAINER" 90

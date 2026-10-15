@@ -10,6 +10,16 @@
 #   LLM_BASE_URL=https://api.example.com/v1 \
 #   docker compose up -d --build
 # 默认 LLM_MODE=proxy 时无需 LLM_API_KEY/LLM_BASE_URL（走 context_proxy 绑定）。
+#
+# 可选 PostgreSQL 后端（默认不启用，knowledge 继续用卷里的 SQLite）：
+#   1) 在 env 文件里设：
+#        KNOWLEDGE_DB_URL=postgres://tdai:tdai-local-only@postgres:5432/knowledge
+#      （用户名/密码/库名与下面 postgres 服务的 KNOWLEDGE_POSTGRES_* 保持一致）
+#   2) 带 profile 启动，一并起内置的 postgres 服务：
+#        docker compose --env-file docker/env.docker --profile postgres up -d
+#   也可以只设 KNOWLEDGE_DB_URL 指向外部 Postgres，不带 profile。
+#   每个 Postgres schema 只允许一个 knowledge 进程（advisory lock，第二个会退出）；
+#   PgBouncer 事务模式不支持。切换后端不迁移数据，回退时去掉 KNOWLEDGE_DB_URL 即可。
 
 services:
   knowledge:
@@ -30,6 +40,15 @@ services:
       KNOWLEDGE_CLICKHOUSE_FLUSH_THRESHOLD: ${KNOWLEDGE_CLICKHOUSE_FLUSH_THRESHOLD:-50}
       KNOWLEDGE_CLICKHOUSE_TTL_DAYS: ${KNOWLEDGE_CLICKHOUSE_TTL_DAYS:-90}
       KNOWLEDGE_CLICKHOUSE_REQUEST_TIMEOUT_MS: ${KNOWLEDGE_CLICKHOUSE_REQUEST_TIMEOUT_MS:-5000}
+      # 留空 = SQLite（KNOWLEDGE_DB_PATH）；postgres:// 或 postgresql:// = Postgres。
+      KNOWLEDGE_DB_URL: ${KNOWLEDGE_DB_URL:-}
+      KNOWLEDGE_DB_SCHEMA: ${KNOWLEDGE_DB_SCHEMA:-knowledge}
+      KNOWLEDGE_DB_POOL_MAX: ${KNOWLEDGE_DB_POOL_MAX:-10}
+    # postgres profile 未启用时，这条依赖被忽略（required: false）。
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
     restart: unless-stopped
     command:
       - --public-url=${PUBLIC_URL:?set PUBLIC_URL e.g. http://203.0.113.10:8421/v3}
@@ -46,5 +65,31 @@ services:
       retries: 3
       start_period: 15s
 
+  # 可选：本地 Postgres（pgvector 镜像，Postgres 17）。只有 `--profile postgres` 才会启动。
+  # 不映射宿主端口：knowledge 在 compose 网络里用主机名 postgres 访问。
+  # 编码/区域固定为 UTF-8，全文检索的中日韩分词依赖它。
+  # 镜像里的初始用户是超级用户，所以 CREATE EXTENSION vector 对它不是问题；
+  # 外部 Postgres 的非超级用户角色需要超级用户先在该库执行一次 CREATE EXTENSION vector。
+  # 默认密码只用于本机；共享/生产环境请通过 KNOWLEDGE_POSTGRES_PASSWORD 覆盖。
+  postgres:
+    image: ${KNOWLEDGE_POSTGRES_IMAGE:-pgvector/pgvector:0.8.0-pg17}
+    profiles: [postgres]
+    environment:
+      POSTGRES_USER: ${KNOWLEDGE_POSTGRES_USER:-tdai}
+      POSTGRES_PASSWORD: ${KNOWLEDGE_POSTGRES_PASSWORD:-tdai-local-only}
+      POSTGRES_DB: ${KNOWLEDGE_POSTGRES_DB:-knowledge}
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8
+    volumes:
+      - knowledge-postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      # -h 127.0.0.1：initdb 期间的临时服务只听 unix socket，走 TCP 才能避免误报 ready。
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
 volumes:
   knowledge-data:
+  knowledge-postgres-data:

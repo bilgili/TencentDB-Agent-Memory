@@ -48,10 +48,10 @@ export interface MemoryStoreContractHarness {
   /** Default embedding dimension of `createStore()`. Vector cases skip when 0/absent. */
   vectorDimensions?: number;
   /**
-   * True when a filtered vector search returns up to topK matching rows however
-   * selective the filter is (filter applied inside the index scan). SQLite
-   * over-fetches max(topK*5, topK+10) candidates and filters afterwards, so a
-   * selective filter far from the query can return fewer rows: it sets false.
+   * True when a filtered vector search returns the min(topK, M) NEAREST matching
+   * rows however selective the filter is (M = matching rows with a usable
+   * vector). Every shipped backend with vector search sets true; the filtered
+   * cases then assert exact ids, otherwise only filter membership and order.
    */
   filteredVectorSearchExact?: boolean;
 }
@@ -424,6 +424,21 @@ function vec(dims: number, axis: number, jitter = 0): Float32Array {
   return v;
 }
 
+/**
+ * A matching row far from a query on axis 0: mostly on axis 2, with an axis-0
+ * component that shrinks with `rank`, so rank 0 is the nearest of them.
+ */
+function farMatch(dims: number, rank: number): Float32Array {
+  const v = new Float32Array(dims);
+  v[0] = 0.5 - rank * 0.04;
+  v[2] = 1;
+  return v;
+}
+
+const TEAM_A = { teamId: "team-a", agentId: "agent-a" } as Partial<MemoryRecord> & Record<string, unknown>;
+const TEAM_B = { teamId: "team-b", agentId: "agent-a" } as Partial<MemoryRecord> & Record<string, unknown>;
+const TEAM_A_FILTER = { teamId: "team-a", agentId: "agent-a" };
+
 function expectScoresDescending(rows: Array<{ score: number }>): void {
   for (let i = 1; i < rows.length; i++) {
     expect(rows[i - 1].score).toBeGreaterThanOrEqual(rows[i].score);
@@ -455,33 +470,85 @@ function runVectorCases(harness: MemoryStoreContractHarness): void {
       }
     });
 
-    it("filtered L1 vector search returns only matching rows (1% filter)", async () => {
+    it("filtered L1 vector search returns the nearest matching rows (1% filter)", async () => {
       const store = await harness.createStore();
       try {
-        // 990 non-matching rows sit right next to the query; the 10 matching
-        // (team-a) rows sit on an orthogonal axis, far from it.
+        // 990 non-matching rows sit right next to the query. The 10 matching
+        // (team-a) rows sit far from it, hit-0 nearest, hit-9 farthest.
         for (let i = 0; i < 990; i++) {
-          await store.upsertL1(
-            makeL1(`far-${i}`, "noise", { teamId: "team-b", agentId: "agent-a" } as Partial<MemoryRecord>),
-            vec(dims, 0, i / 1000),
-          );
+          await store.upsertL1(makeL1(`far-${i}`, "noise", TEAM_B), vec(dims, 0, i / 1000));
         }
         for (let i = 0; i < 10; i++) {
-          await store.upsertL1(
-            makeL1(`hit-${i}`, "signal", { teamId: "team-a", agentId: "agent-a" } as Partial<MemoryRecord>),
-            vec(dims, 2, i / 100),
-          );
+          await store.upsertL1(makeL1(`hit-${i}`, "signal", TEAM_A), farMatch(dims, i));
         }
+        // A matching record without a vector must never be returned.
+        await store.upsertL1(makeL1("hit-novec", "signal without vector", TEAM_A));
 
-        const filter = { teamId: "team-a", agentId: "agent-a" };
-        const hits = await store.searchL1Vector(vec(dims, 0), 5, undefined, filter);
+        const hits = await store.searchL1Vector(vec(dims, 0), 5, undefined, TEAM_A_FILTER);
 
         expect(hits.length).toBeLessThanOrEqual(5);
+        expect(hits.every((h) => h.record_id.startsWith("hit-") && h.record_id !== "hit-novec")).toBe(true);
+        expectScoresDescending(hits);
+        if (harness.filteredVectorSearchExact) {
+          expect(hits.map((h) => h.record_id)).toEqual(["hit-0", "hit-1", "hit-2", "hit-3", "hit-4"]);
+        }
+      } finally {
+        await harness.disposeStore(store);
+      }
+    });
+
+    it("filtered L0 vector search returns the nearest matching rows", async () => {
+      const store = await harness.createStore();
+      try {
+        for (let i = 0; i < 200; i++) {
+          await store.upsertL0(makeL0(`far-${i}`, "noise", TEAM_B), vec(dims, 0, i / 1000));
+        }
+        for (let i = 0; i < 6; i++) {
+          await store.upsertL0(makeL0(`hit-${i}`, "signal", TEAM_A), farMatch(dims, i));
+        }
+
+        const hits = await store.searchL0Vector(vec(dims, 0), 5, undefined, TEAM_A_FILTER);
+
         expect(hits.every((h) => h.record_id.startsWith("hit-"))).toBe(true);
         expectScoresDescending(hits);
         if (harness.filteredVectorSearchExact) {
-          expect(hits.length).toBe(5);
+          expect(hits.map((h) => h.record_id)).toEqual(["hit-0", "hit-1", "hit-2", "hit-3", "hit-4"]);
         }
+      } finally {
+        await harness.disposeStore(store);
+      }
+    });
+
+    it("filtered vector search with fewer matching rows than topK returns all of them", async () => {
+      const store = await harness.createStore();
+      try {
+        // More non-matching rows near the query than any KNN window holds.
+        for (let i = 0; i < 60; i++) {
+          await store.upsertL1(makeL1(`far-${i}`, "noise", TEAM_B), vec(dims, 0, i / 1000));
+        }
+        await store.upsertL1(makeL1("hit-0", "signal", TEAM_A), farMatch(dims, 0));
+        await store.upsertL1(makeL1("hit-1", "signal", TEAM_A), farMatch(dims, 1));
+
+        const hits = await store.searchL1Vector(vec(dims, 0), 5, undefined, TEAM_A_FILTER);
+
+        expect(hits.every((h) => h.record_id.startsWith("hit-"))).toBe(true);
+        if (harness.filteredVectorSearchExact) {
+          expect(hits.map((h) => h.record_id)).toEqual(["hit-0", "hit-1"]);
+        }
+      } finally {
+        await harness.disposeStore(store);
+      }
+    });
+
+    it("a filter with no defined fields behaves as no filter", async () => {
+      const store = await harness.createStore();
+      try {
+        for (let i = 0; i < 20; i++) {
+          await store.upsertL1(makeL1(`r-${i}`, "row", i % 2 ? TEAM_A : TEAM_B), vec(dims, i % 3, i / 100));
+        }
+        const unfiltered = await store.searchL1Vector(vec(dims, 1), 5);
+        const empty = await store.searchL1Vector(vec(dims, 1), 5, undefined, { teamId: undefined });
+        expect(empty.map((h) => h.record_id)).toEqual(unfiltered.map((h) => h.record_id));
       } finally {
         await harness.disposeStore(store);
       }

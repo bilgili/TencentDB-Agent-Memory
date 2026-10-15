@@ -58,7 +58,7 @@ import type {
   AuditEntry,
   AuditQueryFilter,
 } from "../types.js";
-import { DEFAULT_ISOLATION_ID, rowMatchesIsolation } from "../types.js";
+import { DEFAULT_ISOLATION_ID, buildIsolationWhere, rowMatchesIsolation } from "../types.js";
 import { SKILLS_DDL, SKILL_FTS_DDL } from "../../skill/skill-store-ddl.js";
 import type { Logger } from "../../types.js";
 import type {
@@ -1319,6 +1319,72 @@ export class VectorStore implements IMemoryStore {
   }
 
   /**
+   * Candidate rows for a vector search.
+   *
+   * Fast path: vec0 KNN over all tenants, `k = retrieveCount`; the caller's
+   * loop applies the isolation filter. When the search is filtered (non-empty
+   * isolation clause), the KNN window was full, and it holds fewer than `topK`
+   * matching rows with a usable distance, the exact filtered query REPLACES the
+   * candidates: it reads only the matching rows (CROSS JOIN pins records-first
+   * through the isolation indexes, then one vec0 point lookup per row).
+   * Filter values must be strings; `null`/numbers are compared differently by
+   * the SQL clause and `rowMatchesIsolation`.
+   */
+  private vectorCandidates(
+    kind: "l1" | "l0",
+    queryEmbedding: Float32Array,
+    topK: number,
+    filter: IsolationFilter | undefined,
+  ): { rows: Array<{ record_id: string; distance: number }>; retrieveCount: number } {
+    const where = buildIsolationWhere(filter, "r.");
+    const filtered = where.clause !== "";
+    const retrieveCount = filtered
+      ? Math.max(topK * 5, topK + VectorStore.ZERO_VEC_BUFFER)
+      : topK + VectorStore.ZERO_VEC_BUFFER;
+    // Zero-norm query: every cosine distance is undefined.
+    if (!queryEmbedding.some((v) => v !== 0)) return { rows: [], retrieveCount };
+
+    const query = Buffer.from(queryEmbedding.buffer);
+    const knn = (kind === "l1" ? this.stmtSearchVec! : this.stmtL0SearchVec!).all(
+      query,
+      retrieveCount,
+    ) as Array<{ record_id: string; distance: number }>;
+    if (!filtered || knn.length < retrieveCount) return { rows: knn, retrieveCount };
+
+    const records = kind === "l1" ? "l1_records" : "l0_conversations";
+    const vec = kind === "l1" ? "l1_vec" : "l0_vec";
+    const usable = knn.filter((r) => r.distance != null && !Number.isNaN(r.distance));
+    if (usable.length >= topK) {
+      const ids = usable.map((r) => r.record_id);
+      const { n } = this.db.prepare(
+        `SELECT count(*) AS n FROM ${records} r WHERE r.record_id IN (${ids.map(() => "?").join(",")}) AND ${where.clause}`,
+      ).get(...ids, ...where.params) as { n: number };
+      if (n >= topK) return { rows: knn, retrieveCount };
+    }
+
+    try {
+      // ponytail: cost is linear in the number of matching rows (~16µs/row at
+      // 1024 dims) and blocks the event loop; upgrade = a wider vec0 pass
+      // (k = min(4096, rows)) before this query.
+      const exact = this.db.prepare(
+        `SELECT record_id, distance FROM (
+           SELECT r.record_id, vec_distance_cosine(v.embedding, ?) AS distance
+           FROM ${records} r CROSS JOIN ${vec} v ON v.record_id = r.record_id
+           WHERE ${where.clause}
+         ) WHERE distance IS NOT NULL
+         ORDER BY distance LIMIT ?`,
+      ).all(query, ...where.params, topK) as Array<{ record_id: string; distance: number }>;
+      this.logger?.debug?.(`${TAG} [${kind.toUpperCase()}-search] exact filtered fallback returned ${exact.length} row(s)`);
+      return { rows: exact, retrieveCount };
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} [${kind.toUpperCase()}-search] exact filtered fallback failed, keeping KNN candidates: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { rows: knn, retrieveCount };
+    }
+  }
+
+  /**
    * Vector similarity search (cosine distance).
    * Returns top-k results sorted by similarity (highest first).
    *
@@ -1338,19 +1404,13 @@ export class VectorStore implements IMemoryStore {
       // in KNN results.  A small buffer of 10 is sufficient for remnants.
       // NOTE: "AND distance IS NOT NULL" is NOT usable because vec0 does not
       // support that constraint — it causes an empty result set.
-      const ZERO_VEC_BUFFER = 10;
-      const retrieveCount = filter ? Math.max(topK * 5, topK + ZERO_VEC_BUFFER) : topK + ZERO_VEC_BUFFER;
+      const { rows, retrieveCount } = this.vectorCandidates("l1", queryEmbedding, topK, filter);
 
       this.logger?.debug?.(
         `${TAG} [L1-search] START topK=${topK}, retrieveCount=${retrieveCount}, ` +
         `queryEmbeddingDims=${queryEmbedding.length}, ` +
         `queryNorm=${Math.sqrt(Array.from(queryEmbedding).reduce((s, v) => s + v * v, 0)).toFixed(4)}`,
       );
-
-      const rows = this.stmtSearchVec!.all(
-        Buffer.from(queryEmbedding.buffer),
-        retrieveCount,
-      ) as Array<{ record_id: string; distance: number }>;
 
       this.logger?.debug?.(`${TAG} [L1-search] vec0 returned ${rows.length} candidate(s)`);
 
@@ -1870,18 +1930,13 @@ export class VectorStore implements IMemoryStore {
       // in KNN results.
       // NOTE: "AND distance IS NOT NULL" is NOT usable because vec0 does not
       // support that constraint — it causes an empty result set.
-      const retrieveCount = filter ? Math.max(topK * 5, topK + VectorStore.ZERO_VEC_BUFFER) : topK + VectorStore.ZERO_VEC_BUFFER;
+      const { rows, retrieveCount } = this.vectorCandidates("l0", queryEmbedding, topK, filter);
 
       this.logger?.debug?.(
         `${TAG} [L0-search] START topK=${topK}, retrieveCount=${retrieveCount}, ` +
         `queryEmbeddingDims=${queryEmbedding.length}, ` +
         `queryNorm=${Math.sqrt(Array.from(queryEmbedding).reduce((s, v) => s + v * v, 0)).toFixed(4)}`,
       );
-
-      const rows = this.stmtL0SearchVec!.all(
-        Buffer.from(queryEmbedding.buffer),
-        retrieveCount,
-      ) as Array<{ record_id: string; distance: number }>;
 
       this.logger?.debug?.(`${TAG} [L0-search] vec0 returned ${rows.length} candidate(s)`);
 

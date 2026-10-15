@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { loadConfig } from "./config.js";
-import { createDb } from "./db/client.js";
+import { createDb, migrate } from "./db/client.js";
 import { createKnowledgeModule } from "./module.js";
 import { createWikiRoutes } from "./routes/wiki.js";
 import { createCodeGraphRoutes } from "./routes/code-graph.js";
@@ -43,15 +43,28 @@ import { createAnalyticsRoutes } from "./analytics-routes.js";
 
 const log = createLogger("server");
 
-export function createApp() {
+/**
+ * Build the app. Startup order — keep it:
+ *   1. open the database
+ *   2. [Postgres only] take the schema lock on a dedicated client
+ *   3. run the migrations
+ *   4. restart recovery (markInterruptedAsFailed)   — inside createKnowledgeModule
+ *   5. restore in-memory state from synced assets   — inside createKnowledgeModule
+ *   6. serve()                                       — startServer, after this resolves
+ */
+export async function createApp() {
   const config = loadConfig();
   const knowledgeTelemetry = createKnowledgeTelemetry(config.clickhouse);
 
-  // Initialize DB + knowledge module
-  const { db } = createDb({ path: config.dbPath });
+  // 1. open the database (no implicit migration: the order below is explicit)
+  const { db, raw } = createDb({ path: config.dbPath, autoMigrate: false });
+  // 2. schema lock — Postgres only; SQLite has one process per file.
+  // 3. migrations
+  migrate(db, raw);
   // SSH 密钥存储（每用户一对 RSA）。目录默认落在数据卷内（config.sshKeyDir）。
   const sshKeyStore = new SshKeyStore({ rootDir: config.sshKeyDir });
-  const knowledgeModule = createKnowledgeModule({
+  // 4 + 5. recovery, then restore (both awaited)
+  const knowledgeModule = await createKnowledgeModule({
     dataDir: config.dataDir,
     db,
     llmConfig: config.llm,
@@ -155,7 +168,7 @@ export function createApp() {
 }
 
 async function startServer(): Promise<void> {
-  const { app, config, knowledgeTelemetry } = createApp();
+  const { app, config, knowledgeTelemetry } = await createApp();
   await knowledgeTelemetry.initialize();
 
   log.info(`Starting knowledge service on port ${config.port}`);
@@ -173,6 +186,7 @@ async function startServer(): Promise<void> {
     );
   }
 
+  // 6. serve — only after recovery and restore completed
   const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
     log.info(`Knowledge service listening on http://localhost:${info.port}`);
   });

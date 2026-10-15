@@ -65,6 +65,8 @@ export interface CreateCodeGraphInput {
   task_id?: string;
   visibility?: string;
   service_url?: string;
+  /** First build run id: a new code-graph is born pending, so the insert is its claim. */
+  build_run_id?: string;
 }
 
 export interface CodeGraphStatusPatch {
@@ -77,6 +79,8 @@ export interface CodeGraphStatusPatch {
   service_url?: string | null;
   summary?: string | null;
   version?: number;
+  /** Only clearing is allowed here; a run id is written by claimCodeGraphBuild. */
+  build_run_id?: null;
 }
 
 export interface CodeGraphMetaPatch {
@@ -134,6 +138,8 @@ export interface WikiStatusPatch {
   service_url?: string | null;
   summary?: string | null;
   version?: number;
+  /** Only clearing is allowed here; a run id is written by claimWikiBuild. */
+  build_run_id?: null;
 }
 
 export interface WikiMetaPatch {
@@ -198,6 +204,33 @@ export interface SyncedWikiRef {
   team_id: string;
 }
 
+// ───────────────────────── Build claim / fence ─────────────────────────
+
+/**
+ * Build-run fence for status writes: the UPDATE only changes the row while
+ * `build_run_id` equals `runId` (`null` = no build in flight). A write from a
+ * replaced, cancelled, deleted or recovered run therefore changes 0 rows.
+ */
+export interface BuildFence {
+  runId: string | null;
+}
+
+export interface ClaimOptions {
+  /** true = claim even while pending/processing (wiki ingest onBusy:'replace'). */
+  replace?: boolean;
+  /** New build run id; written to build_run_id by the claim. */
+  runId: string;
+}
+
+/**
+ * Result of the atomic "check busy, then mark pending" transition.
+ * `claimed.row` is the row after the claim (status pending, version + 1).
+ */
+export type ClaimResult<T> =
+  | { kind: "claimed"; row: T; prevStatus: WikiStatus; prevVersion: number }
+  | { kind: "busy"; status: "pending" | "processing"; step: string | null }
+  | { kind: "not_found" };
+
 // ───────────────────────── Store interface ─────────────────────────
 
 /**
@@ -209,35 +242,63 @@ export interface SyncedWikiRef {
  */
 export interface IKnowledgeStore {
   // ── Code-Graph ──
-  createCodeGraph(input: CreateCodeGraphInput): CreateResult<CodeGraphRow>;
-  getCodeGraph(serviceId: string, teamId: string, codeGraphId: string): CodeGraphRow | null;
-  getCodeGraphById(serviceId: string, codeGraphId: string): CodeGraphRow | null;
-  listCodeGraphs(serviceId: string, teamId: string, opts?: ListOpts): CodeGraphRow[];
-  countCodeGraphs(serviceId: string, teamId: string, opts?: CountOpts): number;
-  updateCodeGraphStatus(serviceId: string, codeGraphId: string, patch: CodeGraphStatusPatch): void;
-  deleteCodeGraph(serviceId: string, teamId: string, codeGraphId: string): boolean;
-  updateCodeGraphMeta(serviceId: string, codeGraphId: string, patch: CodeGraphMetaPatch): CodeGraphRow | null;
+  createCodeGraph(input: CreateCodeGraphInput): Promise<CreateResult<CodeGraphRow>>;
+  getCodeGraph(serviceId: string, teamId: string, codeGraphId: string): Promise<CodeGraphRow | null>;
+  getCodeGraphById(serviceId: string, codeGraphId: string): Promise<CodeGraphRow | null>;
+  listCodeGraphs(serviceId: string, teamId: string, opts?: ListOpts): Promise<CodeGraphRow[]>;
+  countCodeGraphs(serviceId: string, teamId: string, opts?: CountOpts): Promise<number>;
+  /** UPDATE by id (never inserts). With `fence`, only while build_run_id matches. Returns true iff a row changed. */
+  updateCodeGraphStatus(
+    serviceId: string,
+    codeGraphId: string,
+    patch: CodeGraphStatusPatch,
+    fence?: BuildFence,
+  ): Promise<boolean>;
+  deleteCodeGraph(serviceId: string, teamId: string, codeGraphId: string): Promise<boolean>;
+  updateCodeGraphMeta(serviceId: string, codeGraphId: string, patch: CodeGraphMetaPatch): Promise<CodeGraphRow | null>;
+  /** Atomic busy check + mark pending (version + 1, build_run_id = runId). */
+  claimCodeGraphBuild(
+    serviceId: string,
+    teamId: string,
+    codeGraphId: string,
+    opts: ClaimOptions,
+  ): Promise<ClaimResult<CodeGraphRow>>;
 
   // ── Wiki ──
-  createWiki(input: CreateWikiInput): CreateResult<WikiRow>;
-  getWiki(serviceId: string, teamId: string, wikiId: string): WikiRow | null;
-  getWikiById(serviceId: string, wikiId: string): WikiRow | null;
-  listWikis(serviceId: string, teamId: string, opts?: ListOpts): WikiRow[];
-  countWikis(serviceId: string, teamId: string, opts?: CountOpts): number;
-  updateWikiStatus(serviceId: string, wikiId: string, patch: WikiStatusPatch): void;
-  deleteWiki(serviceId: string, teamId: string, wikiId: string): boolean;
-  updateWikiMeta(serviceId: string, wikiId: string, patch: WikiMetaPatch): WikiRow | null;
+  createWiki(input: CreateWikiInput): Promise<CreateResult<WikiRow>>;
+  getWiki(serviceId: string, teamId: string, wikiId: string): Promise<WikiRow | null>;
+  getWikiById(serviceId: string, wikiId: string): Promise<WikiRow | null>;
+  listWikis(serviceId: string, teamId: string, opts?: ListOpts): Promise<WikiRow[]>;
+  countWikis(serviceId: string, teamId: string, opts?: CountOpts): Promise<number>;
+  /** UPDATE by id (never inserts). With `fence`, only while build_run_id matches. Returns true iff a row changed. */
+  updateWikiStatus(
+    serviceId: string,
+    wikiId: string,
+    patch: WikiStatusPatch,
+    fence?: BuildFence,
+  ): Promise<boolean>;
+  deleteWiki(serviceId: string, teamId: string, wikiId: string): Promise<boolean>;
+  updateWikiMeta(serviceId: string, wikiId: string, patch: WikiMetaPatch): Promise<WikiRow | null>;
+  /** Atomic busy check + mark pending (version + 1, build_run_id = runId). */
+  claimWikiBuild(
+    serviceId: string,
+    teamId: string,
+    wikiId: string,
+    opts: ClaimOptions,
+  ): Promise<ClaimResult<WikiRow>>;
+  /** `SET version = version + 1` in SQL. Returns true iff a row changed. */
+  bumpWikiVersion(serviceId: string, wikiId: string, patch?: { last_sync_at?: string | null }): Promise<boolean>;
 
   // ── Audit ──
-  appendWikiAudit(input: AuditLogInput): void;
-  appendCodeGraphAudit(input: AuditLogInput): void;
-  listWikiAudit(serviceId: string, wikiId: string, limit?: number, offset?: number): AuditLogRow[];
-  listCodeGraphAudit(serviceId: string, codeGraphId: string, limit?: number, offset?: number): AuditLogRow[];
+  appendWikiAudit(input: AuditLogInput): Promise<void>;
+  appendCodeGraphAudit(input: AuditLogInput): Promise<void>;
+  listWikiAudit(serviceId: string, wikiId: string, limit?: number, offset?: number): Promise<AuditLogRow[]>;
+  listCodeGraphAudit(serviceId: string, codeGraphId: string, limit?: number, offset?: number): Promise<AuditLogRow[]>;
 
   // ── Restart recovery ──
-  /** Sweep all non-terminal (pending/processing) assets to failed, across all tenants. */
-  markInterruptedAsFailed(reason?: string): number;
+  /** Sweep all non-terminal (pending/processing) assets to failed and clear build_run_id, across all tenants. */
+  markInterruptedAsFailed(reason?: string): Promise<number>;
   /** All ready code-graphs (with service_id) so module.ts can rebuild per-tenant dirs. */
-  listSyncedCodeGraphs(): SyncedCodeGraphRef[];
-  listSyncedWikis(): SyncedWikiRef[];
+  listSyncedCodeGraphs(): Promise<SyncedCodeGraphRef[]>;
+  listSyncedWikis(): Promise<SyncedWikiRef[]>;
 }

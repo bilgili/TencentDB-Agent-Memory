@@ -125,11 +125,14 @@ export interface KnowledgeModule {
 
 /**
  * Create Knowledge Module (assembly entry point).
- * - Initialize Store / Service / engines
- * - Mark interrupted tasks as failed
- * - Async restore synced instances
+ *
+ * Precondition: the caller has opened the database and run the migrations
+ * (startup steps 1-3, see server.ts createApp). This function then runs, in order:
+ *   4. restart recovery — markInterruptedAsFailed (awaited)
+ *   5. restore in-memory state from the synced assets (awaited)
+ * and returns; the caller calls serve() only after it resolves (step 6).
  */
-export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeModule {
+export async function createKnowledgeModule(config: KnowledgeModuleConfig): Promise<KnowledgeModule> {
   const { dataDir, db, llmConfig } = config;
 
   // Store
@@ -139,8 +142,8 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
   // No binding → global LLM_MODE decides: 'custom' uses global LLM_* direct,
   // 'proxy' (default) blanks creds so ingest fails loudly (no silent fallback).
   const llmBindingStore = createLlmBindingStore(db);
-  const resolveLlm = (serviceId: string): LlmConfig =>
-    resolveLlmConfig(serviceId, llmBindingStore.get(serviceId), llmConfig);
+  const resolveLlm = async (serviceId: string): Promise<LlmConfig> =>
+    resolveLlmConfig(serviceId, await llmBindingStore.get(serviceId), llmConfig);
 
   // Instance pool (code-graph) — lazy loading
   const _poolMap = new Map<string, CodeGraphInstance>();
@@ -190,22 +193,25 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
    * 落库的是干净地址，此处拼出来的带凭据 URL 只活在本次调用栈里
    * （不写盘、不进日志、不进响应体）。
    */
-  const cloneUrlFor = (
+  const cloneUrlFor = async (
     serviceId: string,
     codeGraphId: string,
     repoUrl: string,
-  ): string => {
-    const ref = { type: "code-graph" as const, serviceId, resourceId: codeGraphId };
-    const cred = credentialStore.get(ref);
-    if (!cred) return repoUrl; // 无凭据 = 公开仓
-    const status = credentialStore.status(ref);
-    if (!status) throw new Error(`no credential row for code-graph ${codeGraphId}`);
-    const provider = codeSourceRegistry.get(status.provider_id);
+  ): Promise<string> => {
+    // 一次读一行：凭据 + provider_id。
+    const found = await credentialStore.getWithProvider({
+      type: "code-graph",
+      serviceId,
+      resourceId: codeGraphId,
+    });
+    if (!found) return repoUrl; // 无凭据 = 公开仓
+    const provider = codeSourceRegistry.get(found.provider_id);
     if (!provider) {
       throw new Error(
-        `code source provider '${status.provider_id}' is not registered (check CODE_SOURCE_ENABLED)`,
+        `code source provider '${found.provider_id}' is not registered (check CODE_SOURCE_ENABLED)`,
       );
     }
+    const cred = found.credential;
     return buildCloneUrl(provider, repoUrl, { secret: cred.secret, username: cred.username });
   };
 
@@ -271,7 +277,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
 
     // 外部来源（工蜂等）→ 注入令牌；无凭据行 → 公开仓。
     const cleanUrl = stripCredentials(repoUrl);
-    const effectiveUrl = cloneUrlFor(serviceId, codeGraphId, cleanUrl);
+    const effectiveUrl = await cloneUrlFor(serviceId, codeGraphId, cleanUrl);
     // 判定「是否私有仓」用 URL 是否被改写（等价于凭据行是否存在，且无需再查一次库）。
     const needsCredential = effectiveUrl !== cleanUrl;
 
@@ -400,7 +406,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     setInternalStatus("ingesting");
 
     // Per-instance LLM routing (proxy/byo/global fallback), keyed by service_id.
-    const effectiveLlm = resolveLlm(serviceId);
+    const effectiveLlm = await resolveLlm(serviceId);
     // 进度只推 Panel（Panel 内存 store + wiki/get 聚合）；KS 不落进度态
     const onProgress = config.tmcCallbackUrl
       ? buildProgressFn(config.tmcCallbackUrl, wikiId, serviceId, teamId, ingestRunId)
@@ -439,6 +445,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     queue: sharedQueue,
     logger: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
     callbackConfig,
+    credentialStore,
   });
   const cgService = new CodeGraphService({
     store,
@@ -459,60 +466,58 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     codeSourceRegistry,
   });
 
-  // Restart recovery: mark interrupted tasks as failed
-  const interrupted = store.markInterruptedAsFailed();
+  // ── startup step 4: restart recovery (all tenants; clears build_run_id) ──
+  const interrupted = await store.markInterruptedAsFailed();
   if (interrupted > 0) {
     log.info(`marked ${interrupted} interrupted tasks as failed`);
   }
 
-  // Background restore of synced instances (non-blocking)
-  void (async () => {
-    // Code-graph: lazy loading, just fix stats on startup
-    try {
-      const allSynced = store.listSyncedCodeGraphs();
-      for (const row of allSynced) {
-        const dir = join(dataDir, row.service_id, row.team_id, row.code_graph_id);
-        try {
-          const instance = await openIndex(dir);
-          instancePool.set(row.code_graph_id, instance);
-          const rawStats = getStats(instance);
-          if (rawStats) {
-            const statsJson = JSON.stringify({
-              files: rawStats.fileCount ?? rawStats.files ?? 0,
-              nodes: rawStats.nodeCount ?? rawStats.nodes ?? 0,
-              edges: rawStats.edgeCount ?? rawStats.edges ?? 0,
-            });
-            store.updateCodeGraphStatus(row.service_id, row.code_graph_id, { stats_json: statsJson });
-          }
-          log.info(`[code-graph] restored ${row.code_graph_id}`);
-        } catch (err) {
-          log.warn(`[code-graph] failed to restore ${row.code_graph_id}: ${err instanceof Error ? err.message : String(err)}`);
+  // ── startup step 5: restore in-memory state from the synced assets ──
+  // Code-graph: lazy loading, just fix stats on startup
+  try {
+    const allSynced = await store.listSyncedCodeGraphs();
+    for (const row of allSynced) {
+      const dir = join(dataDir, row.service_id, row.team_id, row.code_graph_id);
+      try {
+        const instance = await openIndex(dir);
+        instancePool.set(row.code_graph_id, instance);
+        const rawStats = getStats(instance);
+        if (rawStats) {
+          const statsJson = JSON.stringify({
+            files: rawStats.fileCount ?? rawStats.files ?? 0,
+            nodes: rawStats.nodeCount ?? rawStats.nodes ?? 0,
+            edges: rawStats.edgeCount ?? rawStats.edges ?? 0,
+          });
+          await store.updateCodeGraphStatus(row.service_id, row.code_graph_id, { stats_json: statsJson });
         }
+        log.info(`[code-graph] restored ${row.code_graph_id}`);
+      } catch (err) {
+        log.warn(`[code-graph] failed to restore ${row.code_graph_id}: ${err instanceof Error ? err.message : String(err)}`);
       }
-      log.info(`[code-graph] ${allSynced.length} synced instances restored`);
-    } catch (err) {
-      log.warn(`[code-graph] restore scan failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    // Wiki: register to engine manager
-    try {
-      const allSyncedWikis = store.listSyncedWikis();
-      for (const row of allSyncedWikis) {
-        const dir = join(dataDir, row.service_id, row.team_id, row.wiki_id);
-        try {
-          wikiMgr.init({ name: row.wiki_id, path: dir });
-          const pages = wikiMgr.getPages(row.wiki_id);
-          if (pages.length > 0) {
-            store.updateWikiStatus(row.service_id, row.wiki_id, { page_count: pages.length });
-          }
-          log.info(`[wiki] restored index ${row.wiki_id} (${pages.length} pages)`);
-        } catch (err) {
-          log.warn(`[wiki] failed to restore ${row.wiki_id}: ${err instanceof Error ? err.message : String(err)}`);
+    log.info(`[code-graph] ${allSynced.length} synced instances restored`);
+  } catch (err) {
+    log.warn(`[code-graph] restore scan failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  // Wiki: register to engine manager
+  try {
+    const allSyncedWikis = await store.listSyncedWikis();
+    for (const row of allSyncedWikis) {
+      const dir = join(dataDir, row.service_id, row.team_id, row.wiki_id);
+      try {
+        wikiMgr.init({ name: row.wiki_id, path: dir });
+        const pages = wikiMgr.getPages(row.wiki_id);
+        if (pages.length > 0) {
+          await store.updateWikiStatus(row.service_id, row.wiki_id, { page_count: pages.length });
         }
+        log.info(`[wiki] restored index ${row.wiki_id} (${pages.length} pages)`);
+      } catch (err) {
+        log.warn(`[wiki] failed to restore ${row.wiki_id}: ${err instanceof Error ? err.message : String(err)}`);
       }
-    } catch (err) {
-      log.warn(`[wiki] restore scan failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-  })();
+  } catch (err) {
+    log.warn(`[wiki] restore scan failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // ── AutoSync Scheduler: 定时拉取 git 仓库并更新 codegraph / 外部 wiki ──
   const autoSyncConfig = resolveAutoSyncConfig();

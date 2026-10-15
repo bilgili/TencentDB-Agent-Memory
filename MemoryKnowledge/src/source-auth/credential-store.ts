@@ -14,6 +14,7 @@ import { createLogger } from "../logger.js";
 import { encodeSecret, decodeSecret } from "./credential-codec.js";
 import type {
   CredentialKind,
+  CredentialWithProvider,
   CredentialStatus,
   ICredentialStore,
   ResourceRef,
@@ -55,46 +56,59 @@ export function createCredentialStore(opts: CredentialStoreOptions): ICredential
     updated_at: row.updatedAt,
   });
 
-  return {
-    get(ref) {
-      const row = db
-        .select()
-        .from(knowledgeSourceCredential)
-        .where(whereRef(ref))
-        .get();
-      if (!row) return null;
+  /** 一行 → 明文凭据 + provider_id；decode 失败 → null（当作未配置）。 */
+  const readOne = (ref: ResourceRef): CredentialWithProvider | null => {
+    const row = db
+      .select()
+      .from(knowledgeSourceCredential)
+      .where(whereRef(ref))
+      .get();
+    if (!row) return null;
 
-      // decode 失败 → null（当作未配置），不抛异常。避免损坏内容被当有效令牌用去 clone。
-      const secret = decodeSecret(row.credSecret);
-      if (secret === null) {
-        log.warn("credential secret malformed, treating as missing", {
+    // decode 失败 → null（当作未配置），不抛异常。避免损坏内容被当有效令牌用去 clone。
+    const secret = decodeSecret(row.credSecret);
+    if (secret === null) {
+      log.warn("credential secret malformed, treating as missing", {
+        resourceType: ref.type,
+        resourceId: ref.resourceId,
+      });
+      return null;
+    }
+
+    let extra: Record<string, unknown> | undefined;
+    if (row.credExtraJson) {
+      try {
+        extra = JSON.parse(row.credExtraJson) as Record<string, unknown>;
+      } catch {
+        log.warn("credential extra_json malformed, ignored", {
           resourceType: ref.type,
           resourceId: ref.resourceId,
         });
-        return null;
       }
+    }
 
-      let extra: Record<string, unknown> | undefined;
-      if (row.credExtraJson) {
-        try {
-          extra = JSON.parse(row.credExtraJson) as Record<string, unknown>;
-        } catch {
-          log.warn("credential extra_json malformed, ignored", {
-            resourceType: ref.type,
-            resourceId: ref.resourceId,
-          });
-        }
-      }
-
-      return {
+    return {
+      credential: {
         kind: row.credKind as CredentialKind,
         secret,
         username: row.credUsername ?? undefined,
         extra,
-      };
+      },
+      provider_id: row.providerId,
+    };
+  };
+
+  // Synchronous better-sqlite3 work inside async methods.
+  return {
+    async get(ref) {
+      return readOne(ref)?.credential ?? null;
     },
 
-    put(ref, cred, providerId, updatedBy) {
+    async getWithProvider(ref) {
+      return readOne(ref);
+    },
+
+    async put(ref, cred, providerId, updatedBy) {
       if (!cred.secret) throw new Error("credential secret must be non-empty");
       const credSecret = encodeSecret(cred.secret);
       const extraJson =
@@ -146,12 +160,12 @@ export function createCredentialStore(opts: CredentialStoreOptions): ICredential
       });
     },
 
-    delete(ref) {
+    async delete(ref) {
       const res = db.delete(knowledgeSourceCredential).where(whereRef(ref)).run();
       return (res.changes ?? 0) > 0;
     },
 
-    status(ref) {
+    async status(ref) {
       const row = db
         .select({
           resourceType: knowledgeSourceCredential.resourceType,
@@ -167,7 +181,7 @@ export function createCredentialStore(opts: CredentialStoreOptions): ICredential
       return row ? rowToStatus(row) : null;
     },
 
-    listAllByType(type) {
+    async listAllByType(type) {
       const rows = db
         .select({
           serviceId: knowledgeSourceCredential.serviceId,
@@ -179,7 +193,7 @@ export function createCredentialStore(opts: CredentialStoreOptions): ICredential
       return rows.map((r) => ({ serviceId: r.serviceId, resourceId: r.resourceId }));
     },
 
-    recordVerify(ref) {
+    async recordVerify(ref) {
       db.update(knowledgeSourceCredential)
         .set({ lastVerifiedAt: nowIso(), updatedAt: nowIso() })
         .where(whereRef(ref))

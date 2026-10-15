@@ -67,15 +67,15 @@ function parseRef(
  * 团队门控：确认 resource_id 属于 actor.teamId。
  * 不存在或 team 不匹配 → 404（不区分，避免探测存在性）。
  */
-function ensureTeamOwnership(
+async function ensureTeamOwnership(
   store: IKnowledgeStore,
   actor: Actor,
   ref: ResourceRef,
-): { ok: true } | { ok: false; status: 404 } {
+): Promise<{ ok: true } | { ok: false; status: 404 }> {
   const row =
     ref.type === "code-graph"
-      ? store.getCodeGraphById(actor.serviceId, ref.resourceId)
-      : store.getWikiById(actor.serviceId, ref.resourceId);
+      ? await store.getCodeGraphById(actor.serviceId, ref.resourceId)
+      : await store.getWikiById(actor.serviceId, ref.resourceId);
   if (!row || row.team_id !== actor.teamId) {
     return { ok: false, status: 404 };
   }
@@ -95,10 +95,10 @@ export function createSourceCredentialRoutes(deps: SourceCredentialRouteDeps): H
     const refOrErr = parseRef(who.serviceId, c.req.query("resource_type"), c.req.query("resource_id"));
     if ("error" in refOrErr) return c.json(wrapError(400, refOrErr.error), 400);
 
-    const gate = ensureTeamOwnership(store, who, refOrErr);
+    const gate = await ensureTeamOwnership(store, who, refOrErr);
     if (!gate.ok) return c.json(wrapError(404, "resource not found"), 404);
 
-    const status = credentialStore.status(refOrErr);
+    const status = await credentialStore.status(refOrErr);
     return c.json(wrapOk({ configured: !!status, credential: status }));
   });
 
@@ -111,10 +111,10 @@ export function createSourceCredentialRoutes(deps: SourceCredentialRouteDeps): H
     const refOrErr = parseRef(who.serviceId, c.req.query("resource_type"), c.req.query("resource_id"));
     if ("error" in refOrErr) return c.json(wrapError(400, refOrErr.error), 400);
 
-    const gate = ensureTeamOwnership(store, who, refOrErr);
+    const gate = await ensureTeamOwnership(store, who, refOrErr);
     if (!gate.ok) return c.json(wrapError(404, "resource not found"), 404);
 
-    const ok = credentialStore.delete(refOrErr);
+    const ok = await credentialStore.delete(refOrErr);
     if (!ok) return c.json(wrapError(404, "credential not found"), 404);
     return c.json(wrapOk({ deleted: true }));
   });
@@ -146,10 +146,10 @@ export function createSourceCredentialRoutes(deps: SourceCredentialRouteDeps): H
       return c.json(wrapError(400, "username is required for basic credential"), 400);
     }
 
-    const gate = ensureTeamOwnership(store, who, refOrErr);
+    const gate = await ensureTeamOwnership(store, who, refOrErr);
     if (!gate.ok) return c.json(wrapError(404, "resource not found"), 404);
 
-    credentialStore.put(
+    await credentialStore.put(
       refOrErr,
       {
         kind,
@@ -165,7 +165,7 @@ export function createSourceCredentialRoutes(deps: SourceCredentialRouteDeps): H
     );
 
     // 只回元数据，永不回吐 secret。
-    const status = credentialStore.status(refOrErr);
+    const status = await credentialStore.status(refOrErr);
     return c.json(wrapOk({ credential: status }));
   });
 

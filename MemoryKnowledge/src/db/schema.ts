@@ -37,6 +37,8 @@ export const knowledgeCodeGraph = sqliteTable(
     serviceUrl: text("service_url"),
     summary: text("summary"),
     version: integer("version").notNull().default(0),
+    // Build-run fence: written by the claim, cleared by the terminal write / recovery.
+    buildRunId: text("build_run_id"),
     lastSyncAt: text("last_sync_at"),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
@@ -74,6 +76,8 @@ export const knowledgeWiki = sqliteTable(
     serviceUrl: text("service_url"),
     summary: text("summary"),
     version: integer("version").notNull().default(0),
+    // Build-run fence: written by the claim, cleared by the terminal write / recovery.
+    buildRunId: text("build_run_id"),
     lastSyncAt: text("last_sync_at"),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),

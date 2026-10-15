@@ -23,6 +23,9 @@ export type {
   AuditLogRow,
   SyncedCodeGraphRef,
   SyncedWikiRef,
+  BuildFence,
+  ClaimOptions,
+  ClaimResult,
 } from "./types.js";
 
 export {
@@ -89,6 +92,7 @@ export type {
   SourceCredential,
   CredentialKind,
   CredentialStatus,
+  CredentialWithProvider,
   ResourceRef,
   ResourceType,
 } from "../source-auth/types.js";

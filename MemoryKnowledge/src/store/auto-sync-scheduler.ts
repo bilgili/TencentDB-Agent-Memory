@@ -226,7 +226,7 @@ export class AutoSyncScheduler {
     try {
       log.info("[auto-sync] scan started");
 
-      const candidates = this.listSyncCandidates();
+      const candidates = await this.listSyncCandidates();
       if (candidates.length === 0) {
         log.info("[auto-sync] no ready repos");
         return;
@@ -253,13 +253,13 @@ export class AutoSyncScheduler {
    * 已在队列或 worker 处理中的仓库由 scan() 里的 inFlight Set 去重，不重复入队；
    * 单仓库的同步节奏天然由 max(sync 耗时, scanIntervalMs) 决定，无需额外冷却。
    */
-  private listSyncCandidates(): SyncTarget[] {
+  private async listSyncCandidates(): Promise<SyncTarget[]> {
     const candidates: SyncTarget[] = [];
 
     // ① code-graph：status = ready（原逻辑，仅包一层 target）
-    for (const ref of this.store.listSyncedCodeGraphs()) {
+    for (const ref of await this.store.listSyncedCodeGraphs()) {
       try {
-        const row = this.store.getCodeGraph(ref.service_id, ref.team_id, ref.code_graph_id);
+        const row = await this.store.getCodeGraph(ref.service_id, ref.team_id, ref.code_graph_id);
         if (!row) continue;
         if (row.status !== "ready") continue;
         candidates.push(toCodeGraphTarget(row));
@@ -270,9 +270,9 @@ export class AutoSyncScheduler {
 
     // ② wiki：**有凭据行的 wiki**（等价于「外部导入」，§4.2）
     if (this.credentialStore) {
-      for (const ref of this.credentialStore.listAllByType("wiki")) {
+      for (const ref of await this.credentialStore.listAllByType("wiki")) {
         try {
-          const row = this.store.getWikiById(ref.serviceId, ref.resourceId);
+          const row = await this.store.getWikiById(ref.serviceId, ref.resourceId);
           if (!row) continue;                              // 资源已删
           candidates.push(toWikiTarget(row));
         } catch (err) {
@@ -324,10 +324,7 @@ export class AutoSyncScheduler {
     const startMs = Date.now();
     log.info(`[auto-sync] sync ${row.code_graph_id} (${row.repo_url}@${row.branch})`);
     try {
-      // CodeGraphService.sync 目前是同步返回 SyncResult；await 兼容未来改 async 或测试 mock。
-      const result: SyncResult = await Promise.resolve(
-        this.cgService.sync(row.service_id, row.team_id, row.code_graph_id, undefined),
-      );
+      const result: SyncResult = await this.cgService.sync(row.service_id, row.team_id, row.code_graph_id, undefined);
       const durationMs = Date.now() - startMs;
       switch (result.kind) {
         case "ok":
@@ -360,7 +357,7 @@ export class AutoSyncScheduler {
       log.debug(`[auto-sync] wiki sync skipped (no importer wired): ${wiki.wiki_id}`);
       return;
     }
-    const cred = this.credentialStore?.get({
+    const cred = await this.credentialStore?.get({
       type: "wiki",
       serviceId: t.serviceId,
       resourceId: wiki.wiki_id,

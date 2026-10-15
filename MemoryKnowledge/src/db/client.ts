@@ -190,6 +190,10 @@ export function migrate(_db: Db, raw: Database.Database): void {
   // service_id on audit tables is nullable → safe to add to existing dev DBs.
   addColumnIfMissing(raw, "knowledge_wiki_audit", "service_id", "TEXT");
   addColumnIfMissing(raw, "knowledge_code_graph_audit", "service_id", "TEXT");
+  // Build-run fence. Nullable → safe on existing files.
+  // These steps move into a versioned SQLite migration list later.
+  addColumnIfMissing(raw, "knowledge_code_graph", "build_run_id", "TEXT");
+  addColumnIfMissing(raw, "knowledge_wiki", "build_run_id", "TEXT");
 }
 
 /** True iff the given table exists in the DB. */

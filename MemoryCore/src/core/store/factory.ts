@@ -5,6 +5,8 @@
  * Supports:
  * - "sqlite" (default): local SQLite + sqlite-vec + FTS5
  * - "tcvdb": Tencent Cloud VectorDB (server-side embedding + hybridSearch)
+ * - "mongodb": MongoDB (MONGODB_* env)
+ * - "postgres": Postgres + pgvector (memory.postgres.*, else POSTGRES_* env), schema of the "default" instance
  *
  * Both backends ship with core — TCVDB is a vendor-provided store that has
  * always been part of the open-source surface of this plugin (matches the
@@ -18,11 +20,20 @@ import { VectorStore } from "./sqlite/memory-store.js";
 import { TcvdbMemoryStore } from "./tcvdb/memory-store.js";
 import { MongoMemoryStore } from "./mongodb/memory-store.js";
 import { getSharedMongoClientPool } from "./mongodb/client-pool.js";
-import { readMongoEnvConfig } from "../../utils/env-config.js";
+import { readMongoEnvConfig, readPostgresEnvConfig } from "../../utils/env-config.js";
 import { createEmbeddingService, NoopEmbeddingService } from "./embedding.js";
 import type { EmbeddingService } from "./embedding.js";
 import { createBM25Encoder } from "./bm25-local.js";
 import type { BM25LocalEncoder } from "./bm25-local.js";
+import {
+  GATEWAY_POSTGRES_SETTING_NAMES,
+  parsePostgresSettings,
+  PLUGIN_POSTGRES_SETTING_NAMES,
+  redactUrl,
+} from "./postgres/settings.js";
+import { getSharedPgPoolRegistry } from "./postgres/pool-registry.js";
+import { pgSchemaName } from "./postgres/schema-name.js";
+import { PostgresMemoryStore } from "./postgres/memory-store.js";
 
 // Re-export for convenience
 export type { IMemoryStore, IEmbeddingService, StoreLogger, BM25LocalEncoder };
@@ -45,6 +56,20 @@ export interface StoreBundle {
  * @param options.dataDir    Plugin data directory.
  * @param options.logger     Logger instance.
  */
+/** App-side embedding service (only when enabled) for stores that keep their own vectors. */
+function createAppEmbedding(config: MemoryTdaiConfig, logger?: StoreLogger): EmbeddingService | undefined {
+  if (!config.embedding.enabled || config.embedding.provider === "local" || !config.embedding.apiKey) return undefined;
+  return createEmbeddingService({
+    provider: config.embedding.provider,
+    baseUrl: config.embedding.baseUrl,
+    apiKey: config.embedding.apiKey,
+    model: config.embedding.model,
+    dimensions: config.embedding.dimensions,
+    sendDimensions: config.embedding.sendDimensions,
+    maxInputChars: config.embedding.maxInputChars,
+  }, logger);
+}
+
 export function createStoreBundle(
   config: MemoryTdaiConfig,
   options: { dataDir: string; logger?: StoreLogger },
@@ -127,21 +152,39 @@ export function createStoreBundle(
       };
     }
 
-    case "sqlite":
-    default: {
-      // ── Embedding service (only when enabled) ──
-      let embeddingService: EmbeddingService | undefined;
-      if (config.embedding.enabled && config.embedding.provider !== "local" && config.embedding.apiKey) {
-        embeddingService = createEmbeddingService({
-          provider: config.embedding.provider,
-          baseUrl: config.embedding.baseUrl,
-          apiKey: config.embedding.apiKey,
-          model: config.embedding.model,
-          dimensions: config.embedding.dimensions,
-          sendDimensions: config.embedding.sendDimensions,
-          maxInputChars: config.embedding.maxInputChars,
-        }, logger);
-      }
+    case "postgres": {
+      // memory.postgres.* wins; without memory.postgres.url fall back to the gateway
+      // POSTGRES_* env, as the mongodb branch reads MONGODB_* (the deploy script
+      // writes only memory.storeBackend). Validate first so a bad setting fails at
+      // startup with the name of the surface it came from.
+      const settings = config.postgres?.url?.trim()
+        ? parsePostgresSettings(config.postgres, PLUGIN_POSTGRES_SETTING_NAMES)
+        : parsePostgresSettings(readPostgresEnvConfig(), GATEWAY_POSTGRES_SETTING_NAMES);
+      // The plugin path serves one instance: the same "default" id as dataDir/vectors.db.
+      const schema = pgSchemaName("mem", "default", settings.schemaPrefix);
+      const dims = config.embedding.dimensions;
+      const store = new PostgresMemoryStore({
+        pool: getSharedPgPoolRegistry(logger).get("store", settings.url, settings.poolMax),
+        schema,
+        dimensions: dims,
+        logger,
+      });
+      const embeddingService = createAppEmbedding(config, logger);
+
+      logger?.debug?.(
+        `${TAG} Store created: backend=postgres, url=${redactUrl(settings.url)}, schema=${schema}, dimensions=${dims}`,
+      );
+
+      return {
+        store,
+        embedding: embeddingService as unknown as IEmbeddingService,
+        bm25Encoder,
+        storeSnapshot: { type: "postgres", postgresUrl: redactUrl(settings.url), postgresSchema: schema },
+      };
+    }
+
+    case "sqlite": {
+      const embeddingService = createAppEmbedding(config, logger);
 
       // dimensions from config (0 when provider="none" → vec0 deferred)
       const dims = config.embedding.dimensions;
@@ -163,6 +206,11 @@ export function createStoreBundle(
           sqlitePath: path.relative(options.dataDir, dbPath),
         },
       };
+    }
+
+    default: {
+      const unknownBackend: never = config.storeBackend;
+      throw new Error(`${TAG} unknown storeBackend: ${String(unknownBackend)}`);
     }
   }
 }

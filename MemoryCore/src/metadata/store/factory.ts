@@ -6,6 +6,14 @@ import { rm } from "node:fs/promises";
 import type { IMetadataStore, MetadataBackend } from "./interface.js";
 import { SqliteMetadataStore } from "./sqlite-adapter.js";
 import {
+  DEFAULT_METADATA_POSTGRES_POOL_MAX,
+  METADATA_POSTGRES_SETTING_NAMES,
+  parsePostgresSettings,
+  type PostgresSettings,
+} from "../../core/store/postgres/settings.js";
+import { pgSchemaName, quoteIdent } from "../../core/store/postgres/schema-name.js";
+import { withMigrationTx } from "../../core/store/postgres/tx.js";
+import {
   DEFAULT_METADATA_DB_PREFIX,
   resolveMetadataDbName,
   resolveSqliteDbDir,
@@ -24,6 +32,8 @@ export interface MetadataStoreConfig {
   storeCacheMaxInstances?: number;
   /** 元数据库名前缀，默认 `tdai_metadata`；完整库名 `{prefix}_{instance_id}`。 */
   mongoDbPrefix?: string;
+  /** Postgres（backend=postgres）：URL、schema 前缀、连接池上限。每实例 schema `{prefix}_meta_{id}`。 */
+  postgres?: PostgresSettings;
 }
 
 export interface PurgeMetadataResult {
@@ -44,14 +54,22 @@ function hasExplicitSqliteBaseDir(env: NodeJS.ProcessEnv): boolean {
   return !!env.TDAI_METADATA_SQLITE_BASE_DIR?.trim();
 }
 
+function hasExplicitPostgresUrl(env: NodeJS.ProcessEnv): boolean {
+  return !!env.TDAI_METADATA_POSTGRES_URL?.trim();
+}
+
 /**
- * Mongo 与 SQLite 根目录不可同时显式配置（env / yaml 回填后校验）。
+ * Mongo / Postgres / SQLite 根目录至多显式配置一个（env / yaml 回填后校验）。
  */
 export function assertMetadataStoreConfigExclusive(env: NodeJS.ProcessEnv = process.env): void {
-  if (hasExplicitMongoUri(env) && hasExplicitSqliteBaseDir(env)) {
+  const set = [
+    hasExplicitMongoUri(env) && "TDAI_METADATA_MONGO_URI",
+    hasExplicitPostgresUrl(env) && "TDAI_METADATA_POSTGRES_URL",
+    hasExplicitSqliteBaseDir(env) && "TDAI_METADATA_SQLITE_BASE_DIR",
+  ].filter((name): name is string => !!name);
+  if (set.length > 1) {
     throw new MetadataStartupValidationError(
-      "Metadata startup validation failed: set either TDAI_METADATA_MONGO_URI or " +
-        "TDAI_METADATA_SQLITE_BASE_DIR, not both",
+      `Metadata startup validation failed: set only one of ${set.join(", ")} (all are set)`,
     );
   }
 }
@@ -61,10 +79,11 @@ export function assertMetadataStoreConfigExclusive(env: NodeJS.ProcessEnv = proc
  *
  * 推断规则（v3.0）：
  *   - TDAI_METADATA_MONGO_URI 非空 → mongodb
+ *   - TDAI_METADATA_POSTGRES_URL 非空 → postgres（_SCHEMA_PREFIX 默认 tdai，_POOL_MAX 默认 5）
  *   - 否则 → sqlite（显式 TDAI_METADATA_SQLITE_BASE_DIR 或 fallback）
- *   - 二者同时显式配置 → 启动报错（见 assertMetadataStoreConfigExclusive）
+ *   - 多个同时显式配置 → 启动报错（见 assertMetadataStoreConfigExclusive）
  *
- * deployMode=service 时须 mongodb（见 validateMetadataStartupConfig）。
+ * deployMode=service 时须 mongodb 或 postgres（见 validateMetadataStartupConfig）。
  *
  * 废弃：TDAI_METADATA_BACKEND、TDAI_METADATA_MONGO_DB、TDAI_METADATA_SQLITE_PATH
  */
@@ -90,6 +109,20 @@ export function loadStoreConfig(
       storeCacheMaxInstances,
       mongoDbPrefix,
     };
+  }
+
+  if (hasExplicitPostgresUrl(env)) {
+    // Throws (naming the variable, URL redacted) on a bad scheme, prefix or pool size.
+    const postgres = parsePostgresSettings(
+      {
+        url: env.TDAI_METADATA_POSTGRES_URL,
+        schemaPrefix: env.TDAI_METADATA_POSTGRES_SCHEMA_PREFIX,
+        poolMax: env.TDAI_METADATA_POSTGRES_POOL_MAX,
+      },
+      METADATA_POSTGRES_SETTING_NAMES,
+      DEFAULT_METADATA_POSTGRES_POOL_MAX,
+    );
+    return { backend: "postgres", postgres, storeCacheMaxInstances, mongoDbPrefix };
   }
 
   return {
@@ -119,8 +152,8 @@ export function validateMetadataStartupConfig(
   }
 
   const errors: string[] = [];
-  if (!config.mongoUri?.trim()) {
-    errors.push("TDAI_METADATA_MONGO_URI is required when deployMode=service");
+  if (!config.mongoUri?.trim() && !config.postgres) {
+    errors.push("TDAI_METADATA_MONGO_URI or TDAI_METADATA_POSTGRES_URL is required when deployMode=service");
   }
   if (errors.length > 0) {
     throw new MetadataStartupValidationError(
@@ -161,11 +194,27 @@ export async function createMetadataStore(
       await store.init();
       return store;
     }
-    case "mysql":
-      throw new Error("MySQL backend not yet implemented");
-    default:
-      throw new Error(`Unknown metadata backend: ${config.backend as string}`);
+    case "postgres": {
+      const pg = requirePostgres(config);
+      const { PostgresMetadataStore } = await import("./postgres-adapter.js");
+      const { getSharedPgPoolRegistry } = await import("../../core/store/postgres/pool-registry.js");
+      const store = new PostgresMetadataStore({
+        pool: getSharedPgPoolRegistry().get("meta", pg.url, pg.poolMax),
+        schema: pgSchemaName("meta", instanceId, pg.schemaPrefix),
+      });
+      await store.init();
+      return store;
+    }
+    default: {
+      const unknown: never = config.backend;
+      throw new Error(`Unknown metadata backend: ${unknown as string}`);
+    }
   }
+}
+
+function requirePostgres(config: MetadataStoreConfig): PostgresSettings {
+  if (!config.postgres) throw new Error("TDAI_METADATA_POSTGRES_URL is required when backend=postgres");
+  return config.postgres;
 }
 
 interface CachedStore {
@@ -259,13 +308,34 @@ export class MetadataStorePool {
     return store;
   }
 
-  async purgeInstance(instanceId: string): Promise<PurgeMetadataResult> {
-    const dbName = resolveMetadataDbName(instanceId, this.dbPrefix);
+  private async evict(instanceId: string): Promise<void> {
     const cached = this.cache.get(instanceId);
     if (cached) {
-      await Promise.resolve(cached.store.close()).catch(() => {});
       this.cache.delete(instanceId);
+      await Promise.resolve(cached.store.close()).catch(() => {});
     }
+  }
+
+  async purgeInstance(instanceId: string): Promise<PurgeMetadataResult> {
+    if (this.config.backend === "postgres") {
+      // evict, then DROP SCHEMA under the schema's migration
+      // lock (so it never interleaves with a concurrent init's migrations), then
+      // evict again — a store created and initialised between the first evict
+      // and the drop would otherwise stay cached on a dropped schema. A later
+      // request recreates an empty schema, as MongoDB does (product decision Q1).
+      const pg = requirePostgres(this.config);
+      const schema = pgSchemaName("meta", instanceId, pg.schemaPrefix);
+      await this.evict(instanceId);
+      const { getSharedPgPoolRegistry } = await import("../../core/store/postgres/pool-registry.js");
+      await withMigrationTx(getSharedPgPoolRegistry().get("meta", pg.url, pg.poolMax), schema, (c) =>
+        c.query(`DROP SCHEMA IF EXISTS ${quoteIdent(schema)} CASCADE`),
+      );
+      await this.evict(instanceId);
+      return { db_name: schema, dropped: true };
+    }
+
+    const dbName = resolveMetadataDbName(instanceId, this.dbPrefix);
+    await this.evict(instanceId);
 
     if (this.config.backend === "mongodb") {
       const client = await this.getSharedMongoClient();

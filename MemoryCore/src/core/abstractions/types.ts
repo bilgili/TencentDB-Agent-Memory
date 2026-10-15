@@ -8,7 +8,7 @@
  * their consumers in src/core/storage/types.ts and are re-used as-is.
  */
 
-import type { VdbConfig, CosConfig, MongoConfig } from "../instance-config-provider.js";
+import type { VdbConfig, CosConfig, MongoConfig, PostgresConfig } from "../instance-config-provider.js";
 
 // ════════════════════════════════════════════════════════
 // IConfigSource — per-instance VDB + global COS config provider
@@ -33,6 +33,13 @@ export interface IConfigSource {
    * error if the mongodb backend is selected against such a source.
    */
   fetchMongo?(instanceId: string): Promise<MongoConfig>;
+
+  /**
+   * Fetch Postgres connection info for a given instance, including the
+   * instance's schema name. Optional like {@link fetchMongo}: `resolvePostgres`
+   * throws a clear error if the postgres backend is selected without it.
+   */
+  fetchPostgres?(instanceId: string): Promise<PostgresConfig>;
 
   /**
    * Fetch global COS credentials. Returns null when the deployment does

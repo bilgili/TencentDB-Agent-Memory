@@ -10,10 +10,14 @@
  *   - Global ID generation (wiki-/cg-) + idempotency: same
  *     (service_id, team_id, repo_url, branch) or (service_id, team_id, name)
  *     duplicate create returns existing.
- *   - Status state machine + restart recovery.
+ *   - Status state machine (atomic build claim + build_run_id fence) + restart recovery.
+ *
+ * Async contract: every method returns a
+ * Promise, but the body is synchronous better-sqlite3 work, so each method is
+ * one statement or one synchronous transaction — atomic by construction.
  */
 
-import { eq, and, isNull, desc, sql, type SQL } from "drizzle-orm";
+import { eq, and, isNull, desc, sql, count, type SQL } from "drizzle-orm";
 import type { Db } from "../db/client.js";
 import {
   knowledgeCodeGraph,
@@ -22,11 +26,23 @@ import {
   knowledgeCodeGraphAudit,
   CODE_DATA_VERSION,
   WIKI_DATA_VERSION,
-} from "../db/schema.js";
+} from "../db/schema.sqlite.js";
 import { genCodeGraphId, genWikiId } from "./ids.js";
+import {
+  claimSet,
+  codeGraphMetaSet,
+  codeGraphStatusSet,
+  inFlightStatus,
+  mapCodeGraphAuditRow,
+  mapCodeGraphRow,
+  mapWikiAuditRow,
+  mapWikiRow,
+  nowIso,
+  wikiMetaSet,
+  wikiStatusSet,
+} from "./rows.js";
 import type {
   IKnowledgeStore,
-  SyncStatus,
   CodeGraphRow,
   CreateCodeGraphInput,
   CodeGraphStatusPatch,
@@ -37,22 +53,25 @@ import type {
   WikiMetaPatch,
   AuditLogInput,
   AuditLogRow,
+  BuildFence,
+  ClaimOptions,
+  ClaimResult,
   CreateResult,
   ListOpts,
   CountOpts,
   SyncedCodeGraphRef,
   SyncedWikiRef,
+  WikiStatus,
 } from "./types.js";
 
 const ID_RETRY = 5;
 
-function nowIso(): string {
-  return new Date().toISOString();
-}
+type FencedTable = typeof knowledgeCodeGraph | typeof knowledgeWiki;
 
-function isUniqueViolation(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /UNIQUE constraint failed|SQLITE_CONSTRAINT/i.test(msg);
+/** `AND build_run_id = $run` (or `IS NULL`) when a fence is given. */
+function fenceCond(table: FencedTable, fence?: BuildFence): SQL | undefined {
+  if (!fence) return undefined;
+  return fence.runId === null ? isNull(table.buildRunId) : eq(table.buildRunId, fence.runId);
 }
 
 // ───────────────────────── Store ─────────────────────────
@@ -63,80 +82,58 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
   // ═══════════════════════ Code-Graph ═══════════════════════
 
   /**
-   * Idempotent create: hit (service_id, team_id, repo_url, branch) returns existing
-   * (existed=true); otherwise generate cg- id and insert (PK conflict auto-retry).
+   * Idempotent create: `INSERT ... ON CONFLICT DO NOTHING RETURNING`, then
+   * SELECT the live row → existed. Never inside a transaction. A row-less result
+   * with no live row means a PK (random id) collision → retry with a new id.
    */
-  createCodeGraph(input: CreateCodeGraphInput): CreateResult<CodeGraphRow> {
-    const existing = this.db
-      .select()
-      .from(knowledgeCodeGraph)
-      .where(
-        and(
-          eq(knowledgeCodeGraph.serviceId, input.service_id),
-          eq(knowledgeCodeGraph.teamId, input.team_id),
-          eq(knowledgeCodeGraph.repoUrl, input.repo_url),
-          eq(knowledgeCodeGraph.branch, input.branch),
-          isNull(knowledgeCodeGraph.deletedAt),
-        ),
-      )
-      .get();
-    if (existing) return { row: this.mapCgRow(existing), existed: true };
-
+  async createCodeGraph(input: CreateCodeGraphInput): Promise<CreateResult<CodeGraphRow>> {
     const ts = nowIso();
     for (let attempt = 0; attempt < ID_RETRY; attempt++) {
-      const id = genCodeGraphId();
-      try {
-        this.db
-          .insert(knowledgeCodeGraph)
-          .values({
-            codeGraphId: id,
-            serviceId: input.service_id,
-            teamId: input.team_id,
-            repoName: input.repo_name ?? "",
-            repoUrl: input.repo_url,
-            branch: input.branch,
-            ownerUserId: input.owner_user_id ?? null,
-            userId: input.user_id ?? null,
-            agentId: input.agent_id ?? null,
-            taskId: input.task_id ?? null,
-            visibility: input.visibility ?? "team",
-            status: "pending",
-            serviceUrl: input.service_url ?? null,
-            version: CODE_DATA_VERSION,
-            createdAt: ts,
-            updatedAt: ts,
-          })
-          .run();
+      const inserted = this.db
+        .insert(knowledgeCodeGraph)
+        .values({
+          codeGraphId: genCodeGraphId(),
+          serviceId: input.service_id,
+          teamId: input.team_id,
+          repoName: input.repo_name ?? "",
+          repoUrl: input.repo_url,
+          branch: input.branch,
+          ownerUserId: input.owner_user_id ?? null,
+          userId: input.user_id ?? null,
+          agentId: input.agent_id ?? null,
+          taskId: input.task_id ?? null,
+          visibility: input.visibility ?? "team",
+          status: "pending",
+          serviceUrl: input.service_url ?? null,
+          buildRunId: input.build_run_id ?? null,
+          version: CODE_DATA_VERSION,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .onConflictDoNothing()
+        .returning()
+        .get();
+      if (inserted) return { row: mapCodeGraphRow(inserted), existed: false };
 
-        const row = this.db
-          .select()
-          .from(knowledgeCodeGraph)
-          .where(eq(knowledgeCodeGraph.codeGraphId, id))
-          .get();
-        return { row: this.mapCgRow(row!), existed: false };
-      } catch (err) {
-        // PK conflict → retry with new id; unique(memory,team,repo,branch) conflict → race, return existing
-        const raced = this.db
-          .select()
-          .from(knowledgeCodeGraph)
-          .where(
-            and(
-              eq(knowledgeCodeGraph.serviceId, input.service_id),
-              eq(knowledgeCodeGraph.teamId, input.team_id),
-              eq(knowledgeCodeGraph.repoUrl, input.repo_url),
-              eq(knowledgeCodeGraph.branch, input.branch),
-              isNull(knowledgeCodeGraph.deletedAt),
-            ),
-          )
-          .get();
-        if (raced) return { row: this.mapCgRow(raced), existed: true };
-        if (!isUniqueViolation(err) || attempt === ID_RETRY - 1) throw err;
-      }
+      const live = this.db
+        .select()
+        .from(knowledgeCodeGraph)
+        .where(
+          and(
+            eq(knowledgeCodeGraph.serviceId, input.service_id),
+            eq(knowledgeCodeGraph.teamId, input.team_id),
+            eq(knowledgeCodeGraph.repoUrl, input.repo_url),
+            eq(knowledgeCodeGraph.branch, input.branch),
+            isNull(knowledgeCodeGraph.deletedAt),
+          ),
+        )
+        .get();
+      if (live) return { row: mapCodeGraphRow(live), existed: true };
     }
     throw new Error("createCodeGraph: failed to allocate unique id");
   }
 
-  getCodeGraph(serviceId: string, teamId: string, codeGraphId: string): CodeGraphRow | null {
+  async getCodeGraph(serviceId: string, teamId: string, codeGraphId: string): Promise<CodeGraphRow | null> {
     const row = this.db
       .select()
       .from(knowledgeCodeGraph)
@@ -148,11 +145,11 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
         ),
       )
       .get();
-    return row ? this.mapCgRow(row) : null;
+    return row ? mapCodeGraphRow(row) : null;
   }
 
   /** id-only accessor — STILL scoped by service_id (cross-Memory leak guard, 001 §2.4). */
-  getCodeGraphById(serviceId: string, codeGraphId: string): CodeGraphRow | null {
+  async getCodeGraphById(serviceId: string, codeGraphId: string): Promise<CodeGraphRow | null> {
     const row = this.db
       .select()
       .from(knowledgeCodeGraph)
@@ -163,10 +160,10 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
         ),
       )
       .get();
-    return row ? this.mapCgRow(row) : null;
+    return row ? mapCodeGraphRow(row) : null;
   }
 
-  listCodeGraphs(serviceId: string, teamId: string, opts?: ListOpts): CodeGraphRow[] {
+  async listCodeGraphs(serviceId: string, teamId: string, opts?: ListOpts): Promise<CodeGraphRow[]> {
     const conditions: SQL[] = [
       eq(knowledgeCodeGraph.serviceId, serviceId),
       eq(knowledgeCodeGraph.teamId, teamId),
@@ -182,10 +179,10 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
       .limit(opts?.limit ?? 20)
       .offset(opts?.offset ?? 0)
       .all();
-    return rows.map((r) => this.mapCgRow(r));
+    return rows.map(mapCodeGraphRow);
   }
 
-  countCodeGraphs(serviceId: string, teamId: string, opts?: CountOpts): number {
+  async countCodeGraphs(serviceId: string, teamId: string, opts?: CountOpts): Promise<number> {
     const conditions: SQL[] = [
       eq(knowledgeCodeGraph.serviceId, serviceId),
       eq(knowledgeCodeGraph.teamId, teamId),
@@ -194,40 +191,36 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
       conditions.push(eq(knowledgeCodeGraph.status, opts.syncStatus));
     }
     const result = this.db
-      .select({ total: sql<number>`count(*)` })
+      .select({ total: count() })
       .from(knowledgeCodeGraph)
       .where(and(...conditions))
       .get();
-    return result?.total ?? 0;
+    return Number(result?.total ?? 0);
   }
 
-  /** id-only mutation — scoped by service_id so a foreign tenant cannot mutate. */
-  updateCodeGraphStatus(serviceId: string, codeGraphId: string, patch: CodeGraphStatusPatch): void {
-    const set: Record<string, unknown> = { updatedAt: nowIso() };
-    if (patch.status !== undefined) set.status = patch.status;
-    if (patch.internal_status !== undefined) set.internalStatus = patch.internal_status;
-    if (patch.sync_error !== undefined) set.syncError = patch.sync_error;
-    if (patch.commit_hash !== undefined) set.commitHash = patch.commit_hash;
-    if (patch.stats_json !== undefined) set.statsJson = patch.stats_json;
-    if (patch.last_sync_at !== undefined) set.lastSyncAt = patch.last_sync_at;
-    if (patch.service_url !== undefined) set.serviceUrl = patch.service_url;
-    if (patch.summary !== undefined) set.summary = patch.summary;
-    if (patch.version !== undefined) set.version = patch.version;
-
-    this.db
+  /** id-only mutation — scoped by service_id; UPDATE only (never inserts); optional build-run fence. */
+  async updateCodeGraphStatus(
+    serviceId: string,
+    codeGraphId: string,
+    patch: CodeGraphStatusPatch,
+    fence?: BuildFence,
+  ): Promise<boolean> {
+    const res = this.db
       .update(knowledgeCodeGraph)
-      .set(set)
+      .set(codeGraphStatusSet(patch))
       .where(
         and(
           eq(knowledgeCodeGraph.codeGraphId, codeGraphId),
           eq(knowledgeCodeGraph.serviceId, serviceId),
+          fenceCond(knowledgeCodeGraph, fence),
         ),
       )
       .run();
+    return res.changes > 0;
   }
 
   /** Hard delete; memory/team mismatch returns false. */
-  deleteCodeGraph(serviceId: string, teamId: string, codeGraphId: string): boolean {
+  async deleteCodeGraph(serviceId: string, teamId: string, codeGraphId: string): Promise<boolean> {
     const result = this.db
       .delete(knowledgeCodeGraph)
       .where(
@@ -241,94 +234,110 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
     return result.changes > 0;
   }
 
-  /** Update code-graph metadata (repo_name, summary). memory mismatch → null. */
-  updateCodeGraphMeta(serviceId: string, codeGraphId: string, patch: CodeGraphMetaPatch): CodeGraphRow | null {
-    const set: Record<string, unknown> = { updatedAt: nowIso() };
-    if (patch.repo_name !== undefined) set.repoName = patch.repo_name;
-    if (patch.summary !== undefined) set.summary = patch.summary;
-    this.db
+  /** Update code-graph metadata (repo_name, summary) — one `UPDATE ... RETURNING`. memory mismatch → null. */
+  async updateCodeGraphMeta(
+    serviceId: string,
+    codeGraphId: string,
+    patch: CodeGraphMetaPatch,
+  ): Promise<CodeGraphRow | null> {
+    const row = this.db
       .update(knowledgeCodeGraph)
-      .set(set)
+      .set(codeGraphMetaSet(patch))
       .where(
         and(
           eq(knowledgeCodeGraph.codeGraphId, codeGraphId),
           eq(knowledgeCodeGraph.serviceId, serviceId),
         ),
       )
-      .run();
-    return this.getCodeGraphById(serviceId, codeGraphId);
+      .returning()
+      .get();
+    return row ? mapCodeGraphRow(row) : null;
+  }
+
+  async claimCodeGraphBuild(
+    serviceId: string,
+    teamId: string,
+    codeGraphId: string,
+    opts: ClaimOptions,
+  ): Promise<ClaimResult<CodeGraphRow>> {
+    const t = knowledgeCodeGraph;
+    return this.db.transaction(
+      (tx): ClaimResult<CodeGraphRow> => {
+        const cur = tx
+          .select()
+          .from(t)
+          .where(and(eq(t.codeGraphId, codeGraphId), eq(t.serviceId, serviceId), eq(t.teamId, teamId)))
+          .get();
+        if (!cur) return { kind: "not_found" };
+        const busy = inFlightStatus(cur.status);
+        if (busy && !opts.replace) return { kind: "busy", status: busy, step: cur.internalStatus };
+        const row = tx
+          .update(t)
+          .set({ ...claimSet(opts.runId), version: sql`${t.version} + 1` })
+          .where(and(eq(t.codeGraphId, codeGraphId), eq(t.serviceId, serviceId)))
+          .returning()
+          .get();
+        if (!row) return { kind: "not_found" };
+        return {
+          kind: "claimed",
+          row: mapCodeGraphRow(row),
+          prevStatus: cur.status as WikiStatus,
+          prevVersion: cur.version,
+        };
+      },
+      { behavior: "immediate" },
+    );
   }
 
   // ═══════════════════════ Wiki ═══════════════════════
 
-  createWiki(input: CreateWikiInput): CreateResult<WikiRow> {
-    const existing = this.db
-      .select()
-      .from(knowledgeWiki)
-      .where(
-        and(
-          eq(knowledgeWiki.serviceId, input.service_id),
-          eq(knowledgeWiki.teamId, input.team_id),
-          eq(knowledgeWiki.name, input.name),
-          isNull(knowledgeWiki.deletedAt),
-        ),
-      )
-      .get();
-    if (existing) return { row: this.mapWikiRow(existing), existed: true };
-
+  /** Idempotent create — see createCodeGraph. */
+  async createWiki(input: CreateWikiInput): Promise<CreateResult<WikiRow>> {
     const ts = nowIso();
     for (let attempt = 0; attempt < ID_RETRY; attempt++) {
-      const id = genWikiId();
-      try {
-        this.db
-          .insert(knowledgeWiki)
-          .values({
-            wikiId: id,
-            serviceId: input.service_id,
-            teamId: input.team_id,
-            name: input.name,
-            sourceType: input.source_type ?? null,
-            sourceUrl: input.source_url ?? null,
-            ownerUserId: input.owner_user_id ?? null,
-            userId: input.user_id ?? null,
-            agentId: input.agent_id ?? null,
-            taskId: input.task_id ?? null,
-            visibility: input.visibility ?? "team",
-            status: "draft",
-            serviceUrl: input.service_url ?? null,
-            version: WIKI_DATA_VERSION,
-            createdAt: ts,
-            updatedAt: ts,
-          })
-          .run();
+      const inserted = this.db
+        .insert(knowledgeWiki)
+        .values({
+          wikiId: genWikiId(),
+          serviceId: input.service_id,
+          teamId: input.team_id,
+          name: input.name,
+          sourceType: input.source_type ?? null,
+          sourceUrl: input.source_url ?? null,
+          ownerUserId: input.owner_user_id ?? null,
+          userId: input.user_id ?? null,
+          agentId: input.agent_id ?? null,
+          taskId: input.task_id ?? null,
+          visibility: input.visibility ?? "team",
+          status: "draft",
+          serviceUrl: input.service_url ?? null,
+          version: WIKI_DATA_VERSION,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .onConflictDoNothing()
+        .returning()
+        .get();
+      if (inserted) return { row: mapWikiRow(inserted), existed: false };
 
-        const row = this.db
-          .select()
-          .from(knowledgeWiki)
-          .where(eq(knowledgeWiki.wikiId, id))
-          .get();
-        return { row: this.mapWikiRow(row!), existed: false };
-      } catch (err) {
-        const raced = this.db
-          .select()
-          .from(knowledgeWiki)
-          .where(
-            and(
-              eq(knowledgeWiki.serviceId, input.service_id),
-              eq(knowledgeWiki.teamId, input.team_id),
-              eq(knowledgeWiki.name, input.name),
-              isNull(knowledgeWiki.deletedAt),
-            ),
-          )
-          .get();
-        if (raced) return { row: this.mapWikiRow(raced), existed: true };
-        if (!isUniqueViolation(err) || attempt === ID_RETRY - 1) throw err;
-      }
+      const live = this.db
+        .select()
+        .from(knowledgeWiki)
+        .where(
+          and(
+            eq(knowledgeWiki.serviceId, input.service_id),
+            eq(knowledgeWiki.teamId, input.team_id),
+            eq(knowledgeWiki.name, input.name),
+            isNull(knowledgeWiki.deletedAt),
+          ),
+        )
+        .get();
+      if (live) return { row: mapWikiRow(live), existed: true };
     }
     throw new Error("createWiki: failed to allocate unique id");
   }
 
-  getWiki(serviceId: string, teamId: string, wikiId: string): WikiRow | null {
+  async getWiki(serviceId: string, teamId: string, wikiId: string): Promise<WikiRow | null> {
     const row = this.db
       .select()
       .from(knowledgeWiki)
@@ -340,25 +349,20 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
         ),
       )
       .get();
-    return row ? this.mapWikiRow(row) : null;
+    return row ? mapWikiRow(row) : null;
   }
 
   /** id-only accessor — STILL scoped by service_id (cross-Memory leak guard, 001 §2.4). */
-  getWikiById(serviceId: string, wikiId: string): WikiRow | null {
+  async getWikiById(serviceId: string, wikiId: string): Promise<WikiRow | null> {
     const row = this.db
       .select()
       .from(knowledgeWiki)
-      .where(
-        and(
-          eq(knowledgeWiki.wikiId, wikiId),
-          eq(knowledgeWiki.serviceId, serviceId),
-        ),
-      )
+      .where(and(eq(knowledgeWiki.wikiId, wikiId), eq(knowledgeWiki.serviceId, serviceId)))
       .get();
-    return row ? this.mapWikiRow(row) : null;
+    return row ? mapWikiRow(row) : null;
   }
 
-  listWikis(serviceId: string, teamId: string, opts?: ListOpts): WikiRow[] {
+  async listWikis(serviceId: string, teamId: string, opts?: ListOpts): Promise<WikiRow[]> {
     const conditions: SQL[] = [
       eq(knowledgeWiki.serviceId, serviceId),
       eq(knowledgeWiki.teamId, teamId),
@@ -374,10 +378,10 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
       .limit(opts?.limit ?? 20)
       .offset(opts?.offset ?? 0)
       .all();
-    return rows.map((r) => this.mapWikiRow(r));
+    return rows.map(mapWikiRow);
   }
 
-  countWikis(serviceId: string, teamId: string, opts?: CountOpts): number {
+  async countWikis(serviceId: string, teamId: string, opts?: CountOpts): Promise<number> {
     const conditions: SQL[] = [
       eq(knowledgeWiki.serviceId, serviceId),
       eq(knowledgeWiki.teamId, teamId),
@@ -386,38 +390,35 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
       conditions.push(eq(knowledgeWiki.status, opts.syncStatus));
     }
     const result = this.db
-      .select({ total: sql<number>`count(*)` })
+      .select({ total: count() })
       .from(knowledgeWiki)
       .where(and(...conditions))
       .get();
-    return result?.total ?? 0;
+    return Number(result?.total ?? 0);
   }
 
-  /** id-only mutation — scoped by service_id so a foreign tenant cannot mutate. */
-  updateWikiStatus(serviceId: string, wikiId: string, patch: WikiStatusPatch): void {
-    const set: Record<string, unknown> = { updatedAt: nowIso() };
-    if (patch.status !== undefined) set.status = patch.status;
-    if (patch.internal_status !== undefined) set.internalStatus = patch.internal_status;
-    if (patch.sync_error !== undefined) set.syncError = patch.sync_error;
-    if (patch.page_count !== undefined) set.pageCount = patch.page_count;
-    if (patch.last_sync_at !== undefined) set.lastSyncAt = patch.last_sync_at;
-    if (patch.service_url !== undefined) set.serviceUrl = patch.service_url;
-    if (patch.summary !== undefined) set.summary = patch.summary;
-    if (patch.version !== undefined) set.version = patch.version;
-
-    this.db
+  /** id-only mutation — scoped by service_id; UPDATE only (never inserts); optional build-run fence. */
+  async updateWikiStatus(
+    serviceId: string,
+    wikiId: string,
+    patch: WikiStatusPatch,
+    fence?: BuildFence,
+  ): Promise<boolean> {
+    const res = this.db
       .update(knowledgeWiki)
-      .set(set)
+      .set(wikiStatusSet(patch))
       .where(
         and(
           eq(knowledgeWiki.wikiId, wikiId),
           eq(knowledgeWiki.serviceId, serviceId),
+          fenceCond(knowledgeWiki, fence),
         ),
       )
       .run();
+    return res.changes > 0;
   }
 
-  deleteWiki(serviceId: string, teamId: string, wikiId: string): boolean {
+  async deleteWiki(serviceId: string, teamId: string, wikiId: string): Promise<boolean> {
     const result = this.db
       .delete(knowledgeWiki)
       .where(
@@ -431,27 +432,72 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
     return result.changes > 0;
   }
 
-  /** Update wiki metadata (name, summary). memory mismatch → null. */
-  updateWikiMeta(serviceId: string, wikiId: string, patch: WikiMetaPatch): WikiRow | null {
-    const set: Record<string, unknown> = { updatedAt: nowIso() };
-    if (patch.name !== undefined) set.name = patch.name;
-    if (patch.summary !== undefined) set.summary = patch.summary;
-    this.db
+  /** Update wiki metadata (name, summary) — one `UPDATE ... RETURNING`. memory mismatch → null. */
+  async updateWikiMeta(serviceId: string, wikiId: string, patch: WikiMetaPatch): Promise<WikiRow | null> {
+    const row = this.db
       .update(knowledgeWiki)
-      .set(set)
-      .where(
-        and(
-          eq(knowledgeWiki.wikiId, wikiId),
-          eq(knowledgeWiki.serviceId, serviceId),
-        ),
-      )
+      .set(wikiMetaSet(patch))
+      .where(and(eq(knowledgeWiki.wikiId, wikiId), eq(knowledgeWiki.serviceId, serviceId)))
+      .returning()
+      .get();
+    return row ? mapWikiRow(row) : null;
+  }
+
+  async claimWikiBuild(
+    serviceId: string,
+    teamId: string,
+    wikiId: string,
+    opts: ClaimOptions,
+  ): Promise<ClaimResult<WikiRow>> {
+    const t = knowledgeWiki;
+    return this.db.transaction(
+      (tx): ClaimResult<WikiRow> => {
+        const cur = tx
+          .select()
+          .from(t)
+          .where(and(eq(t.wikiId, wikiId), eq(t.serviceId, serviceId), eq(t.teamId, teamId)))
+          .get();
+        if (!cur) return { kind: "not_found" };
+        const busy = inFlightStatus(cur.status);
+        if (busy && !opts.replace) return { kind: "busy", status: busy, step: cur.internalStatus };
+        const row = tx
+          .update(t)
+          .set({ ...claimSet(opts.runId), version: sql`${t.version} + 1` })
+          .where(and(eq(t.wikiId, wikiId), eq(t.serviceId, serviceId)))
+          .returning()
+          .get();
+        if (!row) return { kind: "not_found" };
+        return {
+          kind: "claimed",
+          row: mapWikiRow(row),
+          prevStatus: cur.status as WikiStatus,
+          prevVersion: cur.version,
+        };
+      },
+      { behavior: "immediate" },
+    );
+  }
+
+  async bumpWikiVersion(
+    serviceId: string,
+    wikiId: string,
+    patch?: { last_sync_at?: string | null },
+  ): Promise<boolean> {
+    const res = this.db
+      .update(knowledgeWiki)
+      .set({
+        version: sql`${knowledgeWiki.version} + 1`,
+        updatedAt: nowIso(),
+        ...(patch?.last_sync_at !== undefined ? { lastSyncAt: patch.last_sync_at } : {}),
+      })
+      .where(and(eq(knowledgeWiki.wikiId, wikiId), eq(knowledgeWiki.serviceId, serviceId)))
       .run();
-    return this.getWikiById(serviceId, wikiId);
+    return res.changes > 0;
   }
 
   // ═══════════════════════ Audit ═══════════════════════
 
-  appendWikiAudit(input: AuditLogInput): void {
+  async appendWikiAudit(input: AuditLogInput): Promise<void> {
     this.db
       .insert(knowledgeWikiAudit)
       .values({
@@ -467,7 +513,7 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
       .run();
   }
 
-  appendCodeGraphAudit(input: AuditLogInput): void {
+  async appendCodeGraphAudit(input: AuditLogInput): Promise<void> {
     this.db
       .insert(knowledgeCodeGraphAudit)
       .values({
@@ -483,34 +529,24 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
       .run();
   }
 
-  listWikiAudit(serviceId: string, wikiId: string, limit = 20, offset = 0): AuditLogRow[] {
+  async listWikiAudit(serviceId: string, wikiId: string, limit = 20, offset = 0): Promise<AuditLogRow[]> {
     const rows = this.db
       .select()
       .from(knowledgeWikiAudit)
-      .where(
-        and(
-          eq(knowledgeWikiAudit.wikiId, wikiId),
-          eq(knowledgeWikiAudit.serviceId, serviceId),
-        ),
-      )
+      .where(and(eq(knowledgeWikiAudit.wikiId, wikiId), eq(knowledgeWikiAudit.serviceId, serviceId)))
       .orderBy(desc(knowledgeWikiAudit.version), desc(knowledgeWikiAudit.id))
       .limit(limit)
       .offset(offset)
       .all();
-    return rows.map((r) => ({
-      id: r.id,
-      service_id: r.serviceId ?? null,
-      asset_id: r.wikiId,
-      version: r.version,
-      action: r.action as AuditLogRow["action"],
-      user_id: r.userId,
-      agent_id: r.agentId,
-      detail: r.detail,
-      created_at: r.createdAt,
-    }));
+    return rows.map(mapWikiAuditRow);
   }
 
-  listCodeGraphAudit(serviceId: string, codeGraphId: string, limit = 20, offset = 0): AuditLogRow[] {
+  async listCodeGraphAudit(
+    serviceId: string,
+    codeGraphId: string,
+    limit = 20,
+    offset = 0,
+  ): Promise<AuditLogRow[]> {
     const rows = this.db
       .select()
       .from(knowledgeCodeGraphAudit)
@@ -524,43 +560,40 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
       .limit(limit)
       .offset(offset)
       .all();
-    return rows.map((r) => ({
-      id: r.id,
-      service_id: r.serviceId ?? null,
-      asset_id: r.codeGraphId,
-      version: r.version,
-      action: r.action as AuditLogRow["action"],
-      user_id: r.userId,
-      agent_id: r.agentId,
-      detail: r.detail,
-      created_at: r.createdAt,
-    }));
+    return rows.map(mapCodeGraphAuditRow);
   }
 
   // ═══════════════════════ Restart Recovery ═══════════════════════
 
   /**
-   * Sweep all non-terminal (pending/processing) assets to failed, across all tenants.
-   * After restart, in-memory SerialQueue tasks are lost; this makes them visible to control plane.
+   * Sweep all non-terminal (pending/processing) assets to failed and clear
+   * build_run_id, across all tenants, in one transaction. After restart, the
+   * in-memory queue is lost; this makes them visible to the control plane, and
+   * the cleared run id fences off any write of the old process (K-zombie).
    * @returns total affected rows (code + wiki combined).
    */
-  markInterruptedAsFailed(reason = "interrupted by restart"): number {
+  async markInterruptedAsFailed(reason = "interrupted by restart"): Promise<number> {
     const ts = nowIso();
-    const a = this.db
-      .update(knowledgeCodeGraph)
-      .set({ status: "failed", syncError: reason, updatedAt: ts })
-      .where(sql`status IN ('pending','processing')`)
-      .run();
-    const b = this.db
-      .update(knowledgeWiki)
-      .set({ status: "failed", syncError: reason, updatedAt: ts })
-      .where(sql`status IN ('pending','processing')`)
-      .run();
-    return a.changes + b.changes;
+    return this.db.transaction(
+      (tx) => {
+        const a = tx
+          .update(knowledgeCodeGraph)
+          .set({ status: "failed", syncError: reason, buildRunId: null, updatedAt: ts })
+          .where(sql`status IN ('pending','processing')`)
+          .run();
+        const b = tx
+          .update(knowledgeWiki)
+          .set({ status: "failed", syncError: reason, buildRunId: null, updatedAt: ts })
+          .where(sql`status IN ('pending','processing')`)
+          .run();
+        return a.changes + b.changes;
+      },
+      { behavior: "immediate" },
+    );
   }
 
   /** All ready code-graphs (with service_id) so module.ts can rebuild per-tenant dirs. */
-  listSyncedCodeGraphs(): SyncedCodeGraphRef[] {
+  async listSyncedCodeGraphs(): Promise<SyncedCodeGraphRef[]> {
     return this.db
       .select({
         code_graph_id: knowledgeCodeGraph.codeGraphId,
@@ -568,16 +601,11 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
         team_id: knowledgeCodeGraph.teamId,
       })
       .from(knowledgeCodeGraph)
-      .where(
-        and(
-          eq(knowledgeCodeGraph.status, "ready"),
-          isNull(knowledgeCodeGraph.deletedAt),
-        ),
-      )
+      .where(and(eq(knowledgeCodeGraph.status, "ready"), isNull(knowledgeCodeGraph.deletedAt)))
       .all();
   }
 
-  listSyncedWikis(): SyncedWikiRef[] {
+  async listSyncedWikis(): Promise<SyncedWikiRef[]> {
     return this.db
       .select({
         wiki_id: knowledgeWiki.wikiId,
@@ -585,66 +613,7 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
         team_id: knowledgeWiki.teamId,
       })
       .from(knowledgeWiki)
-      .where(
-        and(eq(knowledgeWiki.status, "ready"), isNull(knowledgeWiki.deletedAt)),
-      )
+      .where(and(eq(knowledgeWiki.status, "ready"), isNull(knowledgeWiki.deletedAt)))
       .all();
-  }
-
-  // ═══════════════════════ Mappers ═══════════════════════
-
-  private mapCgRow(r: typeof knowledgeCodeGraph.$inferSelect): CodeGraphRow {
-    return {
-      code_graph_id: r.codeGraphId,
-      service_id: r.serviceId,
-      team_id: r.teamId,
-      repo_name: r.repoName,
-      repo_url: r.repoUrl,
-      branch: r.branch,
-      commit_hash: r.commitHash,
-      owner_user_id: r.ownerUserId,
-      user_id: r.userId,
-      agent_id: r.agentId,
-      task_id: r.taskId,
-      visibility: r.visibility,
-      status: r.status as SyncStatus,
-      internal_status: r.internalStatus,
-      sync_error: r.syncError,
-      stats_json: r.statsJson,
-      service_url: r.serviceUrl ?? null,
-      summary: r.summary ?? null,
-      version: r.version,
-      last_sync_at: r.lastSyncAt,
-      created_at: r.createdAt,
-      updated_at: r.updatedAt,
-      deleted_at: r.deletedAt ?? null,
-    };
-  }
-
-  private mapWikiRow(r: typeof knowledgeWiki.$inferSelect): WikiRow {
-    return {
-      wiki_id: r.wikiId,
-      service_id: r.serviceId,
-      team_id: r.teamId,
-      name: r.name,
-      source_type: r.sourceType,
-      source_url: r.sourceUrl,
-      owner_user_id: r.ownerUserId,
-      user_id: r.userId,
-      agent_id: r.agentId,
-      task_id: r.taskId,
-      visibility: r.visibility,
-      status: r.status as SyncStatus,
-      internal_status: r.internalStatus,
-      sync_error: r.syncError,
-      page_count: r.pageCount,
-      service_url: r.serviceUrl ?? null,
-      summary: r.summary ?? null,
-      version: r.version,
-      last_sync_at: r.lastSyncAt,
-      created_at: r.createdAt,
-      updated_at: r.updatedAt,
-      deleted_at: r.deletedAt ?? null,
-    };
   }
 }

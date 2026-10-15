@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { loadConfig } from "./config.js";
-import { createDb } from "./db/client.js";
+import { createKnowledgeDb, migrateKnowledgeDb, redactUrl, type CreateKnowledgeDbOptions } from "./db/client.js";
 import { createKnowledgeModule } from "./module.js";
 import { createWikiRoutes } from "./routes/wiki.js";
 import { createCodeGraphRoutes } from "./routes/code-graph.js";
@@ -43,21 +43,41 @@ import { createAnalyticsRoutes } from "./analytics-routes.js";
 
 const log = createLogger("server");
 
-export function createApp() {
+/**
+ * Build the app. Startup order — keep it:
+ *   1. open the database
+ *   2. [Postgres only] take the schema lock on a dedicated client (createKnowledgeDb)
+ *   3. run the migrations
+ *   4. restart recovery (markInterruptedAsFailed)   — inside createKnowledgeModule
+ *   5. restore in-memory state from synced assets   — inside createKnowledgeModule
+ *   6. serve()                                       — startServer, after this resolves
+ */
+export async function createApp(opts: CreateKnowledgeDbOptions = {}) {
   const config = loadConfig();
   const knowledgeTelemetry = createKnowledgeTelemetry(config.clickhouse);
 
-  // Initialize DB + knowledge module
-  const { db } = createDb({ path: config.dbPath });
+  // 1 + 2. open the database; on Postgres this also takes the schema lock on a
+  // dedicated client (rejects when another process holds it; lock loss → exit).
+  // SQLite has one process per file.
+  const knowledgeDb = await createKnowledgeDb(config.db, opts);
   // SSH 密钥存储（每用户一对 RSA）。目录默认落在数据卷内（config.sshKeyDir）。
   const sshKeyStore = new SshKeyStore({ rootDir: config.sshKeyDir });
-  const knowledgeModule = createKnowledgeModule({
-    dataDir: config.dataDir,
-    db,
-    llmConfig: config.llm,
-    tmcCallbackUrl: config.tmcCallbackUrl,
-    sshKeyStore,
-  });
+  let knowledgeModule: Awaited<ReturnType<typeof createKnowledgeModule>>;
+  try {
+    // 3. migrations
+    await migrateKnowledgeDb(knowledgeDb);
+    // 4 + 5. recovery, then restore (both awaited)
+    knowledgeModule = await createKnowledgeModule({
+      dataDir: config.dataDir,
+      knowledgeDb,
+      llmConfig: config.llm,
+      tmcCallbackUrl: config.tmcCallbackUrl,
+      sshKeyStore,
+    });
+  } catch (err) {
+    await knowledgeDb.close(); // release the schema lock and the pool, so the process can exit
+    throw err;
+  }
 
   // Hono app
   const app = new Hono();
@@ -151,16 +171,16 @@ export function createApp() {
     log.warn("OpenAPI spec not found at openapi.yaml, skipping Swagger UI");
   }
 
-  return { app, config, knowledgeModule, knowledgeTelemetry };
+  return { app, config, knowledgeModule, knowledgeTelemetry, knowledgeDb };
 }
 
 async function startServer(): Promise<void> {
-  const { app, config, knowledgeTelemetry } = createApp();
+  const { app, config, knowledgeModule, knowledgeTelemetry, knowledgeDb } = await createApp();
   await knowledgeTelemetry.initialize();
 
   log.info(`Starting knowledge service on port ${config.port}`);
   log.info(`Data dir: ${config.dataDir}`);
-  log.info(`DB path: ${config.dbPath}`);
+  log.info(config.db.url ? `DB: postgres ${redactUrl(config.db.url)} schema=${config.db.schema}` : `DB path: ${config.db.path}`);
   log.info(`API prefix: ${config.apiPrefix}`);
   log.info(`ClickHouse telemetry: ${config.clickhouse.enabled ? "enabled" : "disabled"}`);
   // Security posture：空 key 只 warn 不拒启（向后兼容），与 Core gateway 的默认开放语义一致。
@@ -173,6 +193,7 @@ async function startServer(): Promise<void> {
     );
   }
 
+  // 6. serve — only after recovery and restore completed
   const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
     log.info(`Knowledge service listening on http://localhost:${info.port}`);
   });
@@ -182,8 +203,13 @@ async function startServer(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     log.info(`Received ${signal}, shutting down`);
-    await knowledgeTelemetry.shutdown();
-    server.close(() => process.exit(0));
+    // No new sync runs may start once the DB is closing.
+    knowledgeModule.autoSyncScheduler.stop();
+    await knowledgeTelemetry.shutdown().catch((err: unknown) => {
+      log.warn("telemetry shutdown failed", { error: err instanceof Error ? err.message : String(err) });
+    });
+    // HTTP first, then the DB (pool + schema lock); a clean lock-client end is not a lock loss.
+    server.close(() => void knowledgeDb.close().finally(() => process.exit(0)));
   };
   process.once("SIGTERM", () => void shutdown("SIGTERM"));
   process.once("SIGINT", () => void shutdown("SIGINT"));

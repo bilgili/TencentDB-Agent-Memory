@@ -13,6 +13,7 @@
  */
 
 import { DuplicateUserKeyError, type IMetadataStore } from "../store/interface.js";
+import { isUniqueViolation as isDriverUniqueViolation } from "../../core/store/errors.js";
 // UserSessionDefaultService (v3.3): 值 import, 用于 MetadataService.userSessionDefault
 // 懒初始化。循环 import 风险: 该 service 回头 import MetadataError (值) + MetadataService
 // (类型), MetadataError 是本模块的 class, 顶层 class 声明在 import 之前已完成 hoisting,
@@ -162,21 +163,6 @@ export type ChatMemoryContentCleaner = (params: {
   teamId: string;
   agentId: string;
 }) => Promise<void>;
-
-/** Detect unique constraint violation (SQLite UNIQUE or MongoDB E11000) on a specific column. */
-function isUniqueViolation(err: unknown, column?: string): boolean {
-  if (!(err instanceof Error)) return false;
-  const msg = err.message;
-  if (/UNIQUE constraint failed/.test(msg)) {
-    return column ? msg.includes(column) : true;
-  }
-  if ((err as any).code === 11000) {
-    if (!column) return true;
-    const kp = (err as any).keyPattern;
-    return kp ? column in kp : msg.includes(column);
-  }
-  return false;
-}
 
 export interface AgentBasicData {
   agent_id: string;
@@ -427,10 +413,20 @@ export class MetadataService {
     }
 
     // 核心操作：创建 admin 用户
-    const created = await this.createUserWithType(
-      { username: input.username, default_key_value: input.user_key },
-      "system_admin",
-    );
+    // Two processes on one shared store (e.g. Postgres) can both pass the
+    // checks above; the ux_meta_users_system_admin index rejects the loser.
+    let created: Awaited<ReturnType<typeof this.createUserWithType>>;
+    try {
+      created = await this.createUserWithType(
+        { username: input.username, default_key_value: input.user_key },
+        "system_admin",
+      );
+    } catch (err) {
+      if (isDriverUniqueViolation(err) && (await this.store.countSystemAdmins()) > 0) {
+        throw new MetadataError("already_initialized", "system_admin already exists");
+      }
+      throw err;
+    }
 
     // 辅助操作：自动创建默认 Team 和 Agent（失败不阻塞核心流程）
     try {

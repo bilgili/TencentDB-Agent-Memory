@@ -22,7 +22,8 @@ export interface ApiTracePolicy {
 }
 
 export function resolveProfile(backend: MetadataBackend = "sqlite"): ApiTraceProfile {
-  return backend === "mongodb" ? "full" : "lite";
+  // Service backends (mongodb, postgres) trace fully; local sqlite stays lite.
+  return backend === "sqlite" ? "lite" : "full";
 }
 
 export function resolvePolicy(backend: MetadataBackend = "sqlite"): ApiTracePolicy {

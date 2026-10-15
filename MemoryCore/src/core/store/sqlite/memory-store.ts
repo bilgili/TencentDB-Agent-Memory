@@ -58,7 +58,7 @@ import type {
   AuditEntry,
   AuditQueryFilter,
 } from "../types.js";
-import { DEFAULT_ISOLATION_ID, rowMatchesIsolation } from "../types.js";
+import { DEFAULT_ISOLATION_ID, buildIsolationWhere, rowMatchesIsolation } from "../types.js";
 import { SKILLS_DDL, SKILL_FTS_DDL } from "../../skill/skill-store-ddl.js";
 import type { Logger } from "../../types.js";
 import type {
@@ -159,6 +159,26 @@ const require = createRequire(import.meta.url);
 function requireNodeSqlite(): typeof import("node:sqlite") {
   return require("node:sqlite") as typeof import("node:sqlite");
 }
+
+/** Columns returned by every L1 record read (user_id / agent_id included for isolation checks downstream). */
+const L1_QUERY_COLS = `record_id, content, type, priority, scene_name, session_key, session_id,
+      team_id, task_id, user_id, agent_id, version,
+      timestamp_str, timestamp_start, timestamp_end,
+      created_time, updated_time, metadata_json`;
+
+/** FTS5 result columns. The isolation columns are UNINDEXED but still filterable in WHERE. */
+const L1_FTS_SELECT = `
+  SELECT record_id, content_original AS content, type, priority, scene_name,
+         session_key, session_id, team_id, task_id, user_id, agent_id, version,
+         timestamp_str, timestamp_start, timestamp_end,
+         metadata_json,
+         bm25(l1_fts) AS rank
+  FROM l1_fts`;
+const L0_FTS_SELECT = `
+  SELECT record_id, message_text_original AS message_text,
+         session_key, session_id, team_id, task_id, user_id, agent_id, role, recorded_at, timestamp,
+         bm25(l0_fts) AS rank
+  FROM l0_fts`;
 
 // ============================
 // FTS5 / keyword helpers
@@ -992,17 +1012,7 @@ export class VectorStore implements IMemoryStore {
 
       this.stmtL1FtsDelete = this.db.prepare("DELETE FROM l1_fts WHERE record_id = ?");
 
-      this.stmtL1FtsSearch = this.db.prepare(`
-        SELECT record_id, content_original AS content, type, priority, scene_name,
-               session_key, session_id, team_id, task_id, user_id, agent_id, version,
-               timestamp_str, timestamp_start, timestamp_end,
-               metadata_json,
-               bm25(l1_fts) AS rank
-        FROM l1_fts
-        WHERE l1_fts MATCH ?
-        ORDER BY rank ASC
-        LIMIT ?
-      `);
+      this.stmtL1FtsSearch = this.db.prepare(`${L1_FTS_SELECT} WHERE l1_fts MATCH ? ORDER BY rank ASC LIMIT ?`);
 
       // L0 FTS prepared statements
       this.stmtL0FtsInsert = this.db.prepare(`
@@ -1013,15 +1023,7 @@ export class VectorStore implements IMemoryStore {
 
       this.stmtL0FtsDelete = this.db.prepare("DELETE FROM l0_fts WHERE record_id = ?");
 
-      this.stmtL0FtsSearch = this.db.prepare(`
-        SELECT record_id, message_text_original AS message_text,
-               session_key, session_id, team_id, task_id, user_id, agent_id, role, recorded_at, timestamp,
-               bm25(l0_fts) AS rank
-        FROM l0_fts
-        WHERE l0_fts MATCH ?
-        ORDER BY rank ASC
-        LIMIT ?
-      `);
+      this.stmtL0FtsSearch = this.db.prepare(`${L0_FTS_SELECT} WHERE l0_fts MATCH ? ORDER BY rank ASC LIMIT ?`);
 
       this.ftsAvailable = true;
       this.logger?.debug?.(`${TAG} FTS5 tables initialized (l1_fts, l0_fts) [schema v2 — jieba segmented]`);
@@ -1053,48 +1055,43 @@ export class VectorStore implements IMemoryStore {
     // L1 query statements (for l1-reader)
     // user_id / agent_id surfaced in every L1 read so callers (router /
     // candidate-pool / l1-reader) can enforce isolation downstream.
-    const l1QueryCols = `record_id, content, type, priority, scene_name, session_key, session_id,
-      team_id, task_id, user_id, agent_id, version,
-      timestamp_str, timestamp_start, timestamp_end,
-      created_time, updated_time, metadata_json`;
-
     this.stmtQueryBySessionId = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
+      SELECT ${L1_QUERY_COLS} FROM l1_records
       WHERE session_id = ?
       ORDER BY updated_time ASC
     `);
 
     this.stmtQueryBySessionIdSince = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
+      SELECT ${L1_QUERY_COLS} FROM l1_records
       WHERE session_id = ? AND updated_time > ?
       ORDER BY updated_time ASC
     `);
 
     this.stmtQueryBySessionKey = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
+      SELECT ${L1_QUERY_COLS} FROM l1_records
       WHERE session_key = ?
       ORDER BY updated_time ASC
     `);
 
     this.stmtQueryBySessionKeySince = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
+      SELECT ${L1_QUERY_COLS} FROM l1_records
       WHERE session_key = ? AND updated_time > ?
       ORDER BY updated_time ASC
     `);
 
     this.stmtQueryAll = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
+      SELECT ${L1_QUERY_COLS} FROM l1_records
       ORDER BY updated_time ASC
     `);
 
     this.stmtQueryAllSince = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
+      SELECT ${L1_QUERY_COLS} FROM l1_records
       WHERE updated_time > ?
       ORDER BY updated_time ASC
     `);
 
     this.stmtL1QueryMigrationCursor = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
+      SELECT ${L1_QUERY_COLS} FROM l1_records
       WHERE record_id > ?
       ORDER BY record_id ASC
       LIMIT ?
@@ -1319,6 +1316,72 @@ export class VectorStore implements IMemoryStore {
   }
 
   /**
+   * Candidate rows for a vector search.
+   *
+   * Fast path: vec0 KNN over all tenants, `k = retrieveCount`; the caller's
+   * loop applies the isolation filter. When the search is filtered (non-empty
+   * isolation clause), the KNN window was full, and it holds fewer than `topK`
+   * matching rows with a usable distance, the exact filtered query REPLACES the
+   * candidates: it reads only the matching rows (CROSS JOIN pins records-first
+   * through the isolation indexes, then one vec0 point lookup per row).
+   * Filter values must be strings; `null`/numbers are compared differently by
+   * the SQL clause and `rowMatchesIsolation`.
+   */
+  private vectorCandidates(
+    kind: "l1" | "l0",
+    queryEmbedding: Float32Array,
+    topK: number,
+    filter: IsolationFilter | undefined,
+  ): { rows: Array<{ record_id: string; distance: number }>; retrieveCount: number } {
+    const where = buildIsolationWhere(filter, "r.");
+    const filtered = where.clause !== "";
+    const retrieveCount = filtered
+      ? Math.max(topK * 5, topK + VectorStore.ZERO_VEC_BUFFER)
+      : topK + VectorStore.ZERO_VEC_BUFFER;
+    // Zero-norm query: every cosine distance is undefined.
+    if (!queryEmbedding.some((v) => v !== 0)) return { rows: [], retrieveCount };
+
+    const query = Buffer.from(queryEmbedding.buffer);
+    const knn = (kind === "l1" ? this.stmtSearchVec! : this.stmtL0SearchVec!).all(
+      query,
+      retrieveCount,
+    ) as Array<{ record_id: string; distance: number }>;
+    if (!filtered || knn.length < retrieveCount) return { rows: knn, retrieveCount };
+
+    const records = kind === "l1" ? "l1_records" : "l0_conversations";
+    const vec = kind === "l1" ? "l1_vec" : "l0_vec";
+    const usable = knn.filter((r) => r.distance != null && !Number.isNaN(r.distance));
+    if (usable.length >= topK) {
+      const ids = usable.map((r) => r.record_id);
+      const { n } = this.db.prepare(
+        `SELECT count(*) AS n FROM ${records} r WHERE r.record_id IN (${ids.map(() => "?").join(",")}) AND ${where.clause}`,
+      ).get(...ids, ...where.params) as { n: number };
+      if (n >= topK) return { rows: knn, retrieveCount };
+    }
+
+    try {
+      // ponytail: cost is linear in the number of matching rows (~16µs/row at
+      // 1024 dims) and blocks the event loop; upgrade = a wider vec0 pass
+      // (k = min(4096, rows)) before this query.
+      const exact = this.db.prepare(
+        `SELECT record_id, distance FROM (
+           SELECT r.record_id, vec_distance_cosine(v.embedding, ?) AS distance
+           FROM ${records} r CROSS JOIN ${vec} v ON v.record_id = r.record_id
+           WHERE ${where.clause}
+         ) WHERE distance IS NOT NULL
+         ORDER BY distance LIMIT ?`,
+      ).all(query, ...where.params, topK) as Array<{ record_id: string; distance: number }>;
+      this.logger?.debug?.(`${TAG} [${kind.toUpperCase()}-search] exact filtered fallback returned ${exact.length} row(s)`);
+      return { rows: exact, retrieveCount };
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} [${kind.toUpperCase()}-search] exact filtered fallback failed, keeping KNN candidates: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { rows: knn, retrieveCount };
+    }
+  }
+
+  /**
    * Vector similarity search (cosine distance).
    * Returns top-k results sorted by similarity (highest first).
    *
@@ -1338,19 +1401,13 @@ export class VectorStore implements IMemoryStore {
       // in KNN results.  A small buffer of 10 is sufficient for remnants.
       // NOTE: "AND distance IS NOT NULL" is NOT usable because vec0 does not
       // support that constraint — it causes an empty result set.
-      const ZERO_VEC_BUFFER = 10;
-      const retrieveCount = filter ? Math.max(topK * 5, topK + ZERO_VEC_BUFFER) : topK + ZERO_VEC_BUFFER;
+      const { rows, retrieveCount } = this.vectorCandidates("l1", queryEmbedding, topK, filter);
 
       this.logger?.debug?.(
         `${TAG} [L1-search] START topK=${topK}, retrieveCount=${retrieveCount}, ` +
         `queryEmbeddingDims=${queryEmbedding.length}, ` +
         `queryNorm=${Math.sqrt(Array.from(queryEmbedding).reduce((s, v) => s + v * v, 0)).toFixed(4)}`,
       );
-
-      const rows = this.stmtSearchVec!.all(
-        Buffer.from(queryEmbedding.buffer),
-        retrieveCount,
-      ) as Array<{ record_id: string; distance: number }>;
 
       this.logger?.debug?.(`${TAG} [L1-search] vec0 returned ${rows.length} candidate(s)`);
 
@@ -1650,9 +1707,22 @@ export class VectorStore implements IMemoryStore {
       const { sessionKey, sessionId, taskId, updatedAfter } = filter ?? {};
 
       let raw: Record<string, unknown>[];
+      const recordIds = filter?.recordIds;
 
       // Priority: sessionId > sessionKey (sessionId is more specific)
-      if (sessionId && updatedAfter) {
+      if (recordIds && recordIds.length > 0) {
+        // Id lookups are rare and small, so build the statement per call. The ids
+        // travel as one JSON parameter, so any list length stays under SQLite's
+        // bound-parameter limit.
+        const conds = ["record_id IN (SELECT value FROM json_each(?))"];
+        const params: SQLInputValue[] = [JSON.stringify(recordIds)];
+        if (sessionId) { conds.push("session_id = ?"); params.push(sessionId); }
+        else if (sessionKey) { conds.push("session_key = ?"); params.push(sessionKey); }
+        if (updatedAfter) { conds.push("updated_time > ?"); params.push(updatedAfter); }
+        raw = this.db.prepare(
+          `SELECT ${L1_QUERY_COLS} FROM l1_records WHERE ${conds.join(" AND ")} ORDER BY updated_time ASC`,
+        ).all(...params) as Record<string, unknown>[];
+      } else if (sessionId && updatedAfter) {
         raw = this.stmtQueryBySessionIdSince.all(sessionId, updatedAfter) as Record<string, unknown>[];
       } else if (sessionId) {
         raw = this.stmtQueryBySessionId.all(sessionId) as Record<string, unknown>[];
@@ -1870,18 +1940,13 @@ export class VectorStore implements IMemoryStore {
       // in KNN results.
       // NOTE: "AND distance IS NOT NULL" is NOT usable because vec0 does not
       // support that constraint — it causes an empty result set.
-      const retrieveCount = filter ? Math.max(topK * 5, topK + VectorStore.ZERO_VEC_BUFFER) : topK + VectorStore.ZERO_VEC_BUFFER;
+      const { rows, retrieveCount } = this.vectorCandidates("l0", queryEmbedding, topK, filter);
 
       this.logger?.debug?.(
         `${TAG} [L0-search] START topK=${topK}, retrieveCount=${retrieveCount}, ` +
         `queryEmbeddingDims=${queryEmbedding.length}, ` +
         `queryNorm=${Math.sqrt(Array.from(queryEmbedding).reduce((s, v) => s + v * v, 0)).toFixed(4)}`,
       );
-
-      const rows = this.stmtL0SearchVec!.all(
-        Buffer.from(queryEmbedding.buffer),
-        retrieveCount,
-      ) as Array<{ record_id: string; distance: number }>;
 
       this.logger?.debug?.(`${TAG} [L0-search] vec0 returned ${rows.length} candidate(s)`);
 
@@ -3004,11 +3069,30 @@ export class VectorStore implements IMemoryStore {
    *
    * **Fault-tolerant**: returns an empty array on any error.
    */
+  /**
+   * Run an FTS5 search with the isolation filter inside the SQL, so the filter
+   * applies before LIMIT and a selective filter cannot be starved by better
+   * matches from other scopes. The prepared statement serves the unfiltered case.
+   */
+  private ftsSearchRows<T>(
+    table: "l0_fts" | "l1_fts",
+    select: string,
+    unfiltered: StatementSync,
+    ftsQuery: string,
+    limit: number,
+    filter: IsolationFilter | undefined,
+  ): T[] {
+    const where = buildIsolationWhere(filter);
+    if (where.clause === "") return unfiltered.all(ftsQuery, limit) as T[];
+    return this.db
+      .prepare(`${select} WHERE ${table} MATCH ? AND ${where.clause} ORDER BY rank ASC LIMIT ?`)
+      .all(ftsQuery, ...where.params, limit) as T[];
+  }
+
   searchL1Fts(ftsQuery: string, limit = 20, filter?: IsolationFilter): FtsSearchResult[] {
     if (this.degraded || !this.ftsAvailable) return [];
     try {
-      const retrieveLimit = filter ? Math.max(limit * 5, limit) : limit;
-      const rows = this.stmtL1FtsSearch.all(ftsQuery, retrieveLimit) as Array<{
+      const rows = this.ftsSearchRows<{
         record_id: string;
         content: string;
         type: string;
@@ -3026,12 +3110,9 @@ export class VectorStore implements IMemoryStore {
         timestamp_end: string;
         metadata_json: string;
         rank: number;
-      }>;
+      }>("l1_fts", L1_FTS_SELECT, this.stmtL1FtsSearch, ftsQuery, limit, filter);
 
-      return rows
-        .filter((r) => rowMatchesIsolation(r, filter))
-        .slice(0, limit)
-        .map((r) => ({
+      return rows.map((r) => ({
           record_id: r.record_id,
           content: r.content,
           type: r.type,
@@ -3070,8 +3151,7 @@ export class VectorStore implements IMemoryStore {
   searchL0Fts(ftsQuery: string, limit = VectorStore.FTS_DEFAULT_LIMIT, filter?: IsolationFilter): L0FtsSearchResult[] {
     if (this.degraded || !this.ftsAvailable) return [];
     try {
-      const retrieveLimit = filter ? Math.max(limit * 5, limit) : limit;
-      const rows = this.stmtL0FtsSearch.all(ftsQuery, retrieveLimit) as Array<{
+      const rows = this.ftsSearchRows<{
         record_id: string;
         message_text: string;
         session_key: string;
@@ -3084,12 +3164,9 @@ export class VectorStore implements IMemoryStore {
         recorded_at: string;
         timestamp: number;
         rank: number;
-      }>;
+      }>("l0_fts", L0_FTS_SELECT, this.stmtL0FtsSearch, ftsQuery, limit, filter);
 
-      return rows
-        .filter((r) => rowMatchesIsolation(r, filter))
-        .slice(0, limit)
-        .map((r) => ({
+      return rows.map((r) => ({
           record_id: r.record_id,
           session_key: r.session_key,
           session_id: r.session_id,

@@ -65,14 +65,14 @@ export function createLlmBindingRoutes(deps: LlmBindingRouteDeps): Hono {
     }
 
     // api_key 校验：首次创建（KS 无此 service_id 记录）时必填；已存在记录时不传则保留原值。
-    const existing = llmBindingStore.get(serviceId);
+    const existing = await llmBindingStore.get(serviceId);
     if (!existing) {
       if (!apiKey) {
         return c.json(wrapError(400, `${mode} mode requires api_key on first set`), 400);
       }
     }
 
-    const row = llmBindingStore.upsert(serviceId, {
+    const row = await llmBindingStore.upsert(serviceId, {
       mode,
       proxy_base_url: proxyBaseUrl ?? null,
       // asOptString 返回 string | undefined；upsert 层把 undefined 解释为"保留原值"
@@ -97,12 +97,12 @@ export function createLlmBindingRoutes(deps: LlmBindingRouteDeps): Hono {
     if (!isValidIdSegment(serviceId)) {
       return c.json(wrapError(400, "x-tdai-service-id header is required"), 400);
     }
-    return c.json(wrapOk(llmBindingStore.status(serviceId)));
+    return c.json(wrapOk(await llmBindingStore.status(serviceId)));
   });
 
   app.post("/list", async (c) => {
     // 不要求 x-tdai-service-id 头：返回所有 binding，供 Panel 启动时缓存全局状态。
-    const items = llmBindingStore.listAll().map((r) => ({
+    const items = (await llmBindingStore.listAll()).map((r) => ({
       service_id: r.service_id,
       mode: r.mode,
       proxy_base_url: r.proxy_base_url,

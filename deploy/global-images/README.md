@@ -68,6 +68,96 @@ cd TencentDB-Agent-Memory/deploy/global-images
   自行备份并手工迁移；后续版本将提供官方迁移工具。L2/L3 文件两种模式都在
   `MEMORY_CORE_VOLUME` 卷。
 
+### PostgreSQL backend (experimental, optional)
+
+SQLite is the default store. The Postgres backend is optional. It stores the memory data, the metadata and the knowledge data in one Postgres server, in separate schemas.
+
+```bash
+./start-all-postgres.sh    # same flow as start-all.sh; writes MEMORY_CORE_STORE_MODE=postgres to .env
+```
+
+What the script does:
+
+- It writes `MEMORY_CORE_STORE_MODE=postgres` to `.env`. Later runs of `./start-all.sh` also keep Postgres.
+- It passes `STORE_MODE`, `POSTGRES_URL` and `TDAI_METADATA_POSTGRES_URL` to memory-core. `MEMORY_CORE_METADATA_BACKEND=auto` makes the metadata follow the store mode.
+- It passes `KNOWLEDGE_DB_URL` to memory-hub. The knowledge data uses the separate schema `knowledge`.
+- If `POSTGRES_URL` is empty, it starts the container `tdai-postgres-local` from `pgvector/pgvector:0.8.0-pg17` on the shared Docker network. The volume `postgres-local-data` holds the data. The container publishes no host port. The script runs `CREATE EXTENSION vector` for you, because the image user is a superuser.
+- It generates `POSTGRES_LOCAL_PASSWORD` at first start and writes it to `.env`. Do not change it after the volume exists.
+- `./stop-all.sh --purge` removes the container, the volume and the network.
+
+#### Requirements
+
+- PostgreSQL 15 or later.
+- A database with UTF-8 (Unicode Transformation Format 8-bit) encoding and a UTF-8 locale, for example `C.UTF-8` or `en_US.UTF-8`. Keyword search of Chinese, Japanese and Korean (CJK) text needs it. The store checks this at start. If the check fails, keyword search runs in degraded mode and the log shows the cause.
+- The pgvector extension, version 0.8.0 or later. The image `pgvector/pgvector:0.8.0-pg17`, or a newer image, includes it.
+
+#### One-time extension setup for an external Postgres
+
+pgvector 0.8.0 is not a trusted extension. A role without superuser rights cannot run `CREATE EXTENSION vector`. A superuser runs this command one time for each database:
+
+```sql
+CREATE EXTENSION vector;
+```
+
+If pgvector is missing or older than 0.8.0, the stores run without vector search. The log shows the cause. Keyword search still works.
+
+#### Settings
+
+Put these settings in `.env`. In `.env`, write `MEMORY_CORE_STORE_MODE=postgres` instead of `STORE_MODE=postgres`. The script passes the value to the container as `STORE_MODE`. `MEMORY_CORE_METADATA_BACKEND` is `auto` by default. It can also be `postgres` or `sqlite`.
+
+| Scope | Setting | Default | Meaning |
+|---|---|---|---|
+| Gateway: memory and skill store | `STORE_MODE=postgres` | `sqlite` | Selects the Postgres store. |
+| Gateway: memory and skill store | `POSTGRES_URL` | none | Connection URL (Uniform Resource Locator). Required when `STORE_MODE=postgres`. |
+| Gateway: memory and skill store | `POSTGRES_SCHEMA_PREFIX` | `tdai` | Prefix of the schema names. |
+| Gateway: memory and skill store | `POSTGRES_POOL_MAX` | `10` | Maximum connections in the pool. |
+| Gateway | `TDAI_SHUTDOWN_DRAIN_MS` | `5000` | Maximum time in milliseconds that the gateway waits for running requests when it stops. Then it closes the open connections. The full stop must fit the grace period of the platform (`docker stop` waits 10 seconds). |
+| Plugin and `TdaiCore` path | `memory.storeBackend: "postgres"` and `memory.postgres.{url,schemaPrefix,poolMax}` | same as above | Same meaning as the gateway settings, for the path without a gateway. |
+| Metadata store | `TDAI_METADATA_POSTGRES_URL` | none | Selects Postgres for the metadata store. Do not set it together with `TDAI_METADATA_MONGO_URI`. |
+| Metadata store | `TDAI_METADATA_POSTGRES_SCHEMA_PREFIX` | `tdai` | Prefix of the metadata schema names. |
+| Metadata store | `TDAI_METADATA_POSTGRES_POOL_MAX` | `5` | Maximum connections in the metadata pool. |
+| MemoryKnowledge | `KNOWLEDGE_DB_URL` | none | A `postgres://` or `postgresql://` URL selects Postgres. If it is not set, `KNOWLEDGE_DB_PATH` (SQLite) applies. |
+| MemoryKnowledge | `KNOWLEDGE_DB_SCHEMA` | `knowledge` | Schema name. The service rejects `public` and names that start with `pg_`. |
+| MemoryKnowledge | `KNOWLEDGE_DB_POOL_MAX` | `10` | Maximum connections in the pool. |
+
+The gateway stops at start in these cases:
+
+- `STORE_MODE` has a value that is not `sqlite`, `tcvdb`, `mongodb` or `postgres`. An empty value selects the default.
+- `STORE_MODE=postgres` without `POSTGRES_URL`.
+- Both `TDAI_METADATA_POSTGRES_URL` and `TDAI_METADATA_MONGO_URI` are set.
+- A URL has a wrong scheme, or a schema prefix is not valid.
+
+In `service` deploy mode, either metadata URL satisfies the metadata requirement. The log hides the password of every Postgres URL.
+
+Optional script variables: `POSTGRES_LOCAL_IMAGE`, `POSTGRES_LOCAL_CONTAINER`, `POSTGRES_LOCAL_VOLUME`, `POSTGRES_LOCAL_DB`.
+
+#### Connection limit
+
+Keep this sum within the server limit:
+
+```text
+gateways × POSTGRES_POOL_MAX
+  + gateways × TDAI_METADATA_POSTGRES_POOL_MAX
+  + KNOWLEDGE_DB_POOL_MAX
+  + 1
+  ≤ max_connections − reserved connections
+```
+
+The `+ 1` is the connection that MemoryKnowledge keeps for its lock. Example: 2 gateways with the default pool sizes need 2 × 10 + 2 × 5 + 10 + 1 = 41 connections. The PostgreSQL default of `max_connections = 100` is enough for this case.
+
+#### One memory-hub process for each schema
+
+Run one MemoryKnowledge process for each Postgres schema. The process takes an advisory lock when it starts. A second process finds the lock and stops with an error. Do not start two replicas on one schema.
+
+PgBouncer in session mode is supported. PgBouncer in transaction mode is not supported for MemoryKnowledge, because it does not keep the session lock.
+
+#### Switch backends and roll back
+
+- Switching backends does not migrate data. A new Postgres store starts empty.
+- The SQLite files stay untouched on the volumes.
+- To roll back, comment out `MEMORY_CORE_STORE_MODE` and `KNOWLEDGE_DB_URL` in `.env`. Then run `./start-all.sh`. The services use the SQLite files on `MEMORY_CORE_VOLUME` and `PANEL_VOLUME` with their earlier data again.
+- Instance destroy deletes no memory data on any backend. The `/v3` instance destroy call drops the metadata schema of the instance. A later request for the same instance can create an empty metadata schema again.
+
 ### 干跑校验（可选）
 
 `verify.sh` 仍可单独使用，只检查环境不启动容器：

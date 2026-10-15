@@ -211,7 +211,7 @@ export function createToolsRoutes(deps: ToolsRouteDeps): Hono {
     if (isWikiId(knowledgeId)) {
       type = "wiki";
       tools = WIKI_TOOLS;
-      const row = wikiService.getById(serviceId, knowledgeId);
+      const row = await wikiService.getById(serviceId, knowledgeId);
       if (!row) return c.json(wrapError(404, "knowledge resource not found"), 404);
       name = row.name;
       summary = row.summary ?? null;
@@ -219,7 +219,7 @@ export function createToolsRoutes(deps: ToolsRouteDeps): Hono {
     } else if (isCodeGraphId(knowledgeId)) {
       type = "code-graph";
       tools = CODE_GRAPH_TOOLS;
-      const row = cgService.getById(serviceId, knowledgeId);
+      const row = await cgService.getById(serviceId, knowledgeId);
       if (!row) return c.json(wrapError(404, "knowledge resource not found"), 404);
       name = row.repo_name || row.repo_url;
       summary = row.summary ?? null;
@@ -271,7 +271,7 @@ export function createToolsRoutes(deps: ToolsRouteDeps): Hono {
         return c.json(wrapError(403, `unknown tool: '${toolName}' for wiki resource '${knowledgeId}'. Use tools/list to discover available tools.`), 403);
       }
 
-      const row = wikiService.getById(serviceId, knowledgeId);
+      const row = await wikiService.getById(serviceId, knowledgeId);
       if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
       return executeWikiTool(serviceId, toolName, row, toolParams, wikiService, wikiMgr);
@@ -283,7 +283,7 @@ export function createToolsRoutes(deps: ToolsRouteDeps): Hono {
         return c.json(wrapError(403, `unknown tool: '${toolName}' for code-graph resource '${knowledgeId}'. Use tools/list to discover available tools.`), 403);
       }
 
-      const row = cgService.getById(serviceId, knowledgeId);
+      const row = await cgService.getById(serviceId, knowledgeId);
       if (!row) return c.json(wrapError(404, "code graph not found"), 404);
 
       return executeCodeGraphTool(serviceId, toolName, row, toolParams, cgService, instancePool);
@@ -311,7 +311,7 @@ async function executeWikiTool(
 
   switch (toolName) {
     case "get_info": {
-      const detail = wikiService.get(serviceId, team_id, wiki_id);
+      const detail = await wikiService.get(serviceId, team_id, wiki_id);
       if (!detail) return Response.json(wrapError(404, "wiki not found"), { status: 404 });
       return Response.json(wrapOk(detail));
     }
@@ -331,7 +331,7 @@ async function executeWikiTool(
       if (row.status !== "ready") {
         return Response.json(wrapOk({ items: [] }));
       }
-      const items = wikiService.pageLs(serviceId, team_id, wiki_id);
+      const items = await wikiService.pageLs(serviceId, team_id, wiki_id);
       if (items === null) return Response.json(wrapError(404, "wiki not found"), { status: 404 });
       return Response.json(wrapOk({ items }));
     }
@@ -343,7 +343,7 @@ async function executeWikiTool(
       if (row.status !== "ready") {
         return Response.json(wrapOk({ items: [] }));
       }
-      const result = wikiService.pageReadMany(serviceId, team_id, wiki_id, refs as string[]);
+      const result = await wikiService.pageReadMany(serviceId, team_id, wiki_id, refs as string[]);
       return Response.json(wrapOk({ items: result }));
     }
     case "get_graph": {
@@ -354,7 +354,7 @@ async function executeWikiTool(
       return Response.json(wrapOk(graphData));
     }
     case "list_raw": {
-      const items = wikiService.rawLs(serviceId, team_id, wiki_id);
+      const items = await wikiService.rawLs(serviceId, team_id, wiki_id);
       if (items === null) return Response.json(wrapError(404, "wiki not found"), { status: 404 });
       return Response.json(wrapOk({ items }));
     }
@@ -363,7 +363,7 @@ async function executeWikiTool(
       if (!Array.isArray(filenames) || filenames.length === 0) {
         return Response.json(wrapError(400, "filenames is required (non-empty array)"), { status: 400 });
       }
-      const result = wikiService.rawReadMany(serviceId, team_id, wiki_id, filenames as string[]);
+      const result = await wikiService.rawReadMany(serviceId, team_id, wiki_id, filenames as string[]);
       return Response.json(wrapOk({ items: result }));
     }
     default:
@@ -406,7 +406,7 @@ async function executeCodeGraphTool(
 
   // get_info is a simple metadata return
   if (toolName === "get_info") {
-    const detail = cgService.get(serviceId, team_id, code_graph_id);
+    const detail = await cgService.get(serviceId, team_id, code_graph_id);
     if (!detail) return Response.json(wrapError(404, "code graph not found"), { status: 404 });
     return Response.json(wrapOk(detail));
   }

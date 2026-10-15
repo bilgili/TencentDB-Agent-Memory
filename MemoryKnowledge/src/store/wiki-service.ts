@@ -32,6 +32,7 @@ import type {
   CountOpts,
 } from "./types.js";
 import { BuildQueue } from "./build-queue.js";
+import type { ICredentialStore } from "../source-auth/types.js";
 import {
   initIndexDb,
   withWriteDb,
@@ -79,8 +80,8 @@ export type IngestResult =
  * ingest 行为选项（设计 2026-09-21 §3.3）。
  * onBusy 仅在 wiki 已有在途任务（status ∈ {pending, processing}）时生效：
  *   - 'reject'（默认）：拒绝，返回 busy（原语义，自动同步/CLI/sync 别名保持不变）；
- *   - 'replace'：置 cancelled 标记 + internal_status='cancelling'，并把新任务
- *     排入 SerialQueue（FIFO）。旧 worker 返回后由检查点做 preserveRaw 收尾。
+ *   - 'replace'：claim 接管该行（新 build_run_id），置 cancelled 标记，并把新任务
+ *     排入 SerialQueue（FIFO）。旧 worker 返回后由检查点收尾，其写入被 run 栅栏拦下。
  */
 export interface IngestOptions {
   onBusy?: "reject" | "replace";
@@ -102,8 +103,10 @@ export interface WikiServiceOptions {
   callbackConfig?: {
     tmcCallbackUrl: string;
     /** Per-instance LLM resolver for summary generation (keyed by service_id). */
-    resolveLlm: (serviceId: string) => import("../config.js").LlmConfig;
+    resolveLlm: (serviceId: string) => Promise<import("../config.js").LlmConfig>;
   };
+  /** Source credential store; cleanupResources deletes the wiki's row. Optional. */
+  credentialStore?: ICredentialStore;
 }
 
 export interface CreateWikiParams {
@@ -239,8 +242,9 @@ export class WikiService {
   private readonly logger?: WikiServiceLogger;
   private readonly callbackConfig?: {
     tmcCallbackUrl: string;
-    resolveLlm: (serviceId: string) => import("../config.js").LlmConfig;
+    resolveLlm: (serviceId: string) => Promise<import("../config.js").LlmConfig>;
   };
+  private readonly credentialStore?: ICredentialStore;
   /**
    * 中止标记（代际化，设计 2026-09-21 §3.3）。
    *
@@ -271,6 +275,7 @@ export class WikiService {
     this.queue = opts.queue ?? new BuildQueue();
     this.logger = opts.logger;
     this.callbackConfig = opts.callbackConfig;
+    this.credentialStore = opts.credentialStore;
   }
 
   dirFor(serviceId: string, teamId: string, wikiId: string): string {
@@ -281,8 +286,8 @@ export class WikiService {
    * 创建 wiki 元数据 + 目录壳。**不自动 ingest**。
    * 幂等：同 (service_id, team_id, name) 返回已有行。
    */
-  create(params: CreateWikiParams): { row: WikiRow; existed: boolean } {
-    const { row, existed } = this.store.createWiki(params);
+  async create(params: CreateWikiParams): Promise<{ row: WikiRow; existed: boolean }> {
+    const { row, existed } = await this.store.createWiki(params);
     if (!existed) {
       const dir = this.dirFor(row.service_id, row.team_id, row.wiki_id);
       mkdirSync(join(dir, "raw", "sources"), { recursive: true });
@@ -292,19 +297,19 @@ export class WikiService {
       } catch (err) {
         this.logger?.warn?.(`[wiki] initIndexDb failed for ${row.wiki_id}: ${String(err)}`);
       }
-      this.audit(row, "create", `create wiki ${row.name}`, params.user_id);
+      await this.audit(row, "create", `create wiki ${row.name}`, params.user_id);
     }
     return { row, existed };
   }
 
   /** Persist service_url for a wiki. Returns updated row or null. */
-  updateServiceUrl(serviceId: string, wikiId: string, serviceUrl: string): WikiRow | null {
-    this.store.updateWikiStatus(serviceId, wikiId, { service_url: serviceUrl });
+  async updateServiceUrl(serviceId: string, wikiId: string, serviceUrl: string): Promise<WikiRow | null> {
+    await this.store.updateWikiStatus(serviceId, wikiId, { service_url: serviceUrl });
     return this.store.getWikiById(serviceId, wikiId);
   }
 
   /** Update wiki metadata (name, summary). Returns updated row or null. */
-  updateMeta(serviceId: string, wikiId: string, patch: { name?: string; summary?: string | null }): WikiRow | null {
+  async updateMeta(serviceId: string, wikiId: string, patch: { name?: string; summary?: string | null }): Promise<WikiRow | null> {
     return this.store.updateWikiMeta(serviceId, wikiId, patch);
   }
 
@@ -314,68 +319,56 @@ export class WikiService {
    *
    * 已有在途任务（pending/processing）时按 opts.onBusy 决定行为（设计 2026-09-21 §3.3）：
    *   - 'reject'（默认）：返回 busy（HTTP 409），不覆盖状态、不写 audit —— 原语义；
-   *   - 'replace'：置 cancelled 标记 + internal_status='cancelling'，并把新任务排入
-   *     SerialQueue（FIFO）。旧 worker 返回时由 runBuild 检查点做 preserveRaw 收尾
-   *     （status 复位到 draft，保留 wiki 行与 raw），新任务出队后正常 scanning。
-   *     这样"取消旧任务 + 排队新任务"在同一调用内原子完成，不存在中间脏态。
+   *   - 'replace'：claimWikiBuild(replace) 一步把行置 pending（version+1，新 build_run_id），
+   *     再置 cancelled 标记并把新任务排入 SerialQueue（FIFO）。旧 worker 返回时由 runBuild
+   *     检查点收尾（保留 wiki 行与 raw）；旧 run 的任何写入都匹配 0 行，新任务出队后正常 scanning。
    */
-  ingest(
+  async ingest(
     serviceId: string,
     teamId: string,
     wikiId: string,
     requesterUserId?: string,
     opts?: IngestOptions,
-  ): IngestResult {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
-    if (!row) return { kind: "not_found" };
-
-    const inFlightStatus = row.status === "pending" || row.status === "processing" ? row.status : null;
-    if (inFlightStatus && opts?.onBusy !== "replace") {
-      // 并发拒绝：正在排队/执行中直接拒绝，不覆盖状态、不重复入队、不写 audit。
-      return { kind: "busy", status: inFlightStatus, step: row.internal_status };
-    }
-    const inFlight = inFlightStatus !== null;
-
-    if (inFlight) {
-      // replace 语义：只中止**当前这一代**（row.version），新任务 version+1 不受影响；
-      // 同时置 cancelling 中间态供前端感知。
-      this.cancelled.set(wikiId, row.version);
-      this.store.updateWikiStatus(serviceId, wikiId, { internal_status: "cancelling" });
-    }
-
-    const nextVersion = row.version + 1;
-    this.store.updateWikiStatus(serviceId, wikiId, {
-      status: "pending",
-      internal_status: null,
-      sync_error: null,
-      version: nextVersion,
+  ): Promise<IngestResult> {
+    // one atomic store transition owns "check busy, then mark pending"
+    // (version + 1, build_run_id = runId). busy / not_found map 1:1 to IngestResult.
+    const runId = randomUUID();
+    const claim = await this.store.claimWikiBuild(serviceId, teamId, wikiId, {
+      replace: opts?.onBusy === "replace",
+      runId,
     });
-    this.audit({ ...row, version: nextVersion }, "ingest", inFlight ? "ingest (replace)" : "manual ingest", requesterUserId);
-    const fresh = this.store.getWiki(serviceId, teamId, wikiId);
-    if (fresh) this.enqueueBuild(fresh);
-    if (!fresh) return { kind: "not_found" };
-    return inFlight ? { kind: "queued", row: fresh } : { kind: "ok", row: fresh };
+    if (claim.kind !== "claimed") return claim;
+
+    const inFlight = claim.prevStatus === "pending" || claim.prevStatus === "processing";
+    if (inFlight) {
+      // replace 语义：只中止**被替换的那一代**（prevVersion），新任务 version+1 不受影响。
+      // 顺序无关紧要：claim 已换掉 build_run_id，旧代的任何迟到写入都匹配 0 行。
+      this.cancelled.set(wikiId, claim.prevVersion);
+    }
+    await this.audit(claim.row, "ingest", inFlight ? "ingest (replace)" : "manual ingest", requesterUserId);
+    this.enqueueBuild(claim.row, runId);
+    return inFlight ? { kind: "queued", row: claim.row } : { kind: "ok", row: claim.row };
   }
 
   /** sync 语义 = 重跑 ingest（管控显式触发）。保持 reject 语义不变。 */
-  sync(serviceId: string, teamId: string, wikiId: string, requesterUserId?: string): IngestResult {
+  async sync(serviceId: string, teamId: string, wikiId: string, requesterUserId?: string): Promise<IngestResult> {
     return this.ingest(serviceId, teamId, wikiId, requesterUserId);
   }
 
-  get(serviceId: string, teamId: string, wikiId: string): WikiRow | null {
+  async get(serviceId: string, teamId: string, wikiId: string): Promise<WikiRow | null> {
     return this.store.getWiki(serviceId, teamId, wikiId);
   }
 
   /** 按全局唯一 wiki_id 查询（仍按 service_id 收敛防跨租户）。spec id-only 端点专用。 */
-  getById(serviceId: string, wikiId: string): WikiRow | null {
+  async getById(serviceId: string, wikiId: string): Promise<WikiRow | null> {
     return this.store.getWikiById(serviceId, wikiId);
   }
 
-  list(serviceId: string, teamId: string, opts?: ListOpts): WikiRow[] {
+  async list(serviceId: string, teamId: string, opts?: ListOpts): Promise<WikiRow[]> {
     return this.store.listWikis(serviceId, teamId, opts);
   }
 
-  count(serviceId: string, teamId: string, opts?: CountOpts): number {
+  async count(serviceId: string, teamId: string, opts?: CountOpts): Promise<number> {
     return this.store.countWikis(serviceId, teamId, opts);
   }
 
@@ -387,8 +380,8 @@ export class WikiService {
    * 硬删 + 清理（不等 worker）。worker 结束前重查发现已删则跳过 ready/回调并再做
    * 一次幂等清理，无残留。
    */
-  delete(serviceId: string, teamId: string, wikiId: string): boolean {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  async delete(serviceId: string, teamId: string, wikiId: string): Promise<boolean> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return false;
 
     if (row.status === "pending" || row.status === "processing") {
@@ -396,8 +389,8 @@ export class WikiService {
       this.cancelled.set(wikiId, WikiService.CANCEL_ALL_VERSIONS);
     }
 
-    this.audit(row, "delete", null);
-    this.cleanupResources(serviceId, teamId, wikiId);
+    await this.audit(row, "delete", null);
+    await this.cleanupResources(serviceId, teamId, wikiId);
     // 不在此删 cancelled 标记（覆盖 delete 先于 worker 检查点的窗口）；
     // worker 结束时由 finishCancelled 移除。cleanup 幂等，重复无害。
     return true;
@@ -407,19 +400,28 @@ export class WikiService {
    * 四类资源幂等清理（顺序：先释放连接，再删盘）。每步独立 try/catch，异常安全。
    *   1. index.db 读连接池：evictWikiDb（幂等；worker 的 withWriteDb finally 本就 close 写连接）
    *   2. 元数据行：硬删（命中 0 行也安全，支持 worker + delete 双重清理）
-   *   3. 磁盘目录（wiki/ raw/ index.db 及 -wal/-shm）：rmSync recursive+force（幂等）
+   *   3. 来源凭据行：删除（幂等；无行也安全）
+   *   4. 磁盘目录（wiki/ raw/ index.db 及 -wal/-shm）：rmSync recursive+force（幂等）
+   * 每步 await 完成后再走下一步（行删完才删盘）。
    * BuildQueue 排队任务由 runBuild 入口检查 cancelled/行存在性跳过，无需在此处理。
    */
-  private cleanupResources(serviceId: string, teamId: string, wikiId: string): void {
+  private async cleanupResources(serviceId: string, teamId: string, wikiId: string): Promise<void> {
     try {
       evictWikiDb(wikiId);
     } catch (err) {
       this.logger?.warn?.(`[wiki] evict index.db failed ${wikiId}: ${String(err)}`);
     }
     try {
-      this.store.deleteWiki(serviceId, teamId, wikiId);
+      await this.store.deleteWiki(serviceId, teamId, wikiId);
     } catch (err) {
       this.logger?.warn?.(`[wiki] hard-delete row failed ${wikiId}: ${String(err)}`);
+    }
+    if (this.credentialStore) {
+      try {
+        await this.credentialStore.delete({ type: "wiki", serviceId, resourceId: wikiId });
+      } catch (err) {
+        this.logger?.warn?.(`[wiki] delete credential failed ${wikiId}: ${String(err)}`);
+      }
     }
     try {
       rmSync(this.dirFor(serviceId, teamId, wikiId), { recursive: true, force: true });
@@ -438,12 +440,12 @@ export class WikiService {
    *
    * 代际比对让 replace 入队的**新任务不会被自己触发的标记误伤**。
    */
-  private isDeleted(serviceId: string, wikiId: string, version: number): boolean {
+  private async isDeleted(serviceId: string, wikiId: string, version: number): Promise<boolean> {
     const marked = this.cancelled.get(wikiId);
     const cancelledHit =
       marked !== undefined &&
       (marked === WikiService.CANCEL_ALL_VERSIONS || marked === version);
-    return cancelledHit || this.store.getWikiById(serviceId, wikiId) === null;
+    return cancelledHit || (await this.store.getWikiById(serviceId, wikiId)) === null;
   }
 
   /**
@@ -458,40 +460,30 @@ export class WikiService {
    *
    * 两种分支都会移除 cancelled 标记。
    */
-  private finishCancelled(
+  private async finishCancelled(
     serviceId: string,
     teamId: string,
     wikiId: string,
+    runId: string,
     opts?: { preserveRaw?: boolean },
-  ): void {
+  ): Promise<void> {
     if (opts?.preserveRaw) {
-      // 仅当"当前行仍是自己这一代（version <= 被取消代际）"才复位到 draft。
-      //
-      // 若新任务已经把 version 推高（replace 时 ingest() 会立刻 version+1 并置
-      // pending），说明新任务已接管这一行 —— 此时**绝不能**复位，否则会把新
-      // 任务的 pending 冲成 draft，前端就会看到"待加工/排队"的假窗口，实际是
-      // 旧 worker 把新任务状态覆盖了。让位不动即可，新任务的状态由它自己驱动。
-      const current = this.store.getWikiById(serviceId, wikiId);
-      const cancelledVersion = this.cancelled.get(wikiId);
-      const superseded =
-        current !== null &&
-        cancelledVersion !== undefined &&
-        cancelledVersion !== WikiService.CANCEL_ALL_VERSIONS &&
-        current.version > cancelledVersion;
-      if (superseded) {
-        this.logger?.info?.(
-          `[wiki] ${wikiId} old build aborted; newer ingest (v${current?.version}) already owns status, leaving as-is`,
-        );
-      } else {
-        this.store.updateWikiStatus(serviceId, wikiId, {
-          status: "draft",
-          internal_status: null,
-          sync_error: "cancelled by user",
-        });
-        this.logger?.info?.(`[wiki] ${wikiId} build aborted (replaced by newer ingest; raw preserved)`);
-      }
+      // 仅当行仍属于本次 run（build_run_id = runId）才复位到 draft。
+      // replace 的新 claim 已把 build_run_id 换成新 run，此时写入匹配 0 行 ——
+      // 新任务的 pending 不会被旧 worker 冲成 draft。
+      const reset = await this.store.updateWikiStatus(
+        serviceId,
+        wikiId,
+        { status: "draft", internal_status: null, sync_error: "cancelled by user", build_run_id: null },
+        { runId },
+      );
+      this.logger?.info?.(
+        reset
+          ? `[wiki] ${wikiId} build aborted (replaced by newer ingest; raw preserved)`
+          : `[wiki] ${wikiId} old build aborted; newer ingest already owns status, leaving as-is`,
+      );
     } else {
-      this.cleanupResources(serviceId, teamId, wikiId);
+      await this.cleanupResources(serviceId, teamId, wikiId);
       this.logger?.info?.(`[wiki] ${wikiId} build aborted (deleted during processing)`);
     }
     this.cancelled.delete(wikiId);
@@ -505,14 +497,14 @@ export class WikiService {
    * 注意：不能直接用 isDeleted() 区分（它是 cancelled 标记 OR 行不存在的双判据），
    * 必须单独查行是否存在。
    */
-  private isCancelledByReplace(serviceId: string, wikiId: string): boolean {
-    return this.store.getWikiById(serviceId, wikiId) !== null;
+  private async isCancelledByReplace(serviceId: string, wikiId: string): Promise<boolean> {
+    return (await this.store.getWikiById(serviceId, wikiId)) !== null;
   }
 
   /** 写一条 wiki 审计记录。失败不阻断主流程。 */
-  private audit(row: WikiRow, action: AuditAction, detail: string | null, requesterUserId?: string): void {
+  private async audit(row: WikiRow, action: AuditAction, detail: string | null, requesterUserId?: string): Promise<void> {
     try {
-      this.store.appendWikiAudit({
+      await this.store.appendWikiAudit({
         service_id: row.service_id,
         asset_id: row.wiki_id,
         version: row.version,
@@ -532,8 +524,8 @@ export class WikiService {
   // ═══════════════════════════════════════════════════════════════════
 
   /** 列出 raw/sources/ 下的素材文件（改查 source 表，设计 003 §3.5）。wiki 不存在返回 null。 */
-  rawLs(serviceId: string, teamId: string, wikiId: string): RawFileEntry[] | null {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  async rawLs(serviceId: string, teamId: string, wikiId: string): Promise<RawFileEntry[] | null> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     const dir = this.dirFor(serviceId, teamId, wikiId);
     try {
@@ -555,8 +547,8 @@ export class WikiService {
   }
 
   /** 读单个 raw 文件原文。文件不存在返回 null（含 wiki 不存在）。 */
-  rawRead(serviceId: string, teamId: string, wikiId: string, filename: string): string | null {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  async rawRead(serviceId: string, teamId: string, wikiId: string, filename: string): Promise<string | null> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     const sourcesDir = join(this.dirFor(serviceId, teamId, wikiId), "raw", "sources");
     const safe = this.resolveRawPath(sourcesDir, filename);
@@ -575,13 +567,13 @@ export class WikiService {
    * - 超 RAW_READ_MAX → 抛错（router 转 400）
    * 单个文件不存在不报错，对应 item 标 not_found:true（spec：整体仍 200）。
    */
-  rawReadMany(
+  async rawReadMany(
     serviceId: string,
     teamId: string,
     wikiId: string,
     filenames: string[],
-  ): WriteOutcome<RawReadItem[]> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  ): Promise<WriteOutcome<RawReadItem[]>> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (filenames.length > RAW_READ_MAX) {
       throw new Error(`filenames exceeds max ${RAW_READ_MAX}`);
@@ -614,15 +606,15 @@ export class WikiService {
    * - 路径穿越 → "invalid_path"
    * - 超 5MB → "too_large"
    */
-  rawWrite(
+  async rawWrite(
     serviceId: string,
     teamId: string,
     wikiId: string,
     filename: string,
     content: string,
     userId?: string,
-  ): WriteOutcome<RawWriteResult> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  ): Promise<WriteOutcome<RawWriteResult>> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     // 注：此处**刻意不拦 processing**。设计 2026-09-21「导入并抽取」要求
     // "新导入覆盖旧导入"：抽取进行中再次导入时必须允许写入 raw，否则返回
@@ -651,14 +643,14 @@ export class WikiService {
    *   的文件），保证整批要么都成功要么都没生效。
    * 错误码同 rawWrite。
    */
-  rawWriteMany(
+  async rawWriteMany(
     serviceId: string,
     teamId: string,
     wikiId: string,
     files: { filename: string; content: string }[],
     userId?: string,
-  ): WriteOutcome<RawWriteManyItem[]> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  ): Promise<WriteOutcome<RawWriteManyItem[]>> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     // 同上（rawWrite）：刻意不拦 processing，以支持"抽取中再次导入"覆盖写入。
     if (files.length > RAW_WRITE_MAX) {
@@ -726,11 +718,9 @@ export class WikiService {
     // 幂等：即使 files 内容全部相同，写盘 + 登记也走一遍，版本仍会前进，
     //   这是 SoT（wiki 表状态）的期望行为：raw 一旦被写过就算作新版本，
     //   由下游 ingest 决定是否真的重新抽取（sha 相同则跳过）。
+    // version + 1 在 SQL 里做（读-改-写会丢增量）。
     if (plans.length > 0) {
-      this.store.updateWikiStatus(serviceId, wikiId, {
-        version: row.version + 1,
-        last_sync_at: new Date().toISOString(),
-      });
+      await this.store.bumpWikiVersion(serviceId, wikiId, { last_sync_at: new Date().toISOString() });
     }
     return plans.map(({ filename, size }) => ({ filename, size }));
   }
@@ -828,7 +818,7 @@ export class WikiService {
     wikiId: string,
     filenames: string[],
   ): Promise<WriteOutcome<RawRmResult>> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (row.status === "processing") return "processing";
     if (filenames.length > RAW_RM_MAX) {
@@ -877,8 +867,8 @@ export class WikiService {
    * 列出 wiki/ 下的 page 文件（recursive 扫描 .md 取 frontmatter）。
    * status≠ready 时返回空数组。
    */
-  pageLs(serviceId: string, teamId: string, wikiId: string): { id: string; title: string; type: string; path: string; description?: string; locked?: boolean }[] | null {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  async pageLs(serviceId: string, teamId: string, wikiId: string): Promise<{ id: string; title: string; type: string; path: string; description?: string; locked?: boolean }[] | null> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (row.status !== "ready") return [];
 
@@ -892,8 +882,8 @@ export class WikiService {
   }
 
   /** 读单个 page 原文。ref 可以是 page id 或 relPath。 */
-  pageRead(serviceId: string, teamId: string, wikiId: string, ref: string): string | null {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  async pageRead(serviceId: string, teamId: string, wikiId: string, ref: string): Promise<string | null> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
 
     const projectPath = this.dirFor(serviceId, teamId, wikiId);
@@ -913,13 +903,13 @@ export class WikiService {
    * - 超 PAGE_READ_MAX → 抛错
    * 单个 ref 不存在不报错，对应 item 标 not_found:true（spec：整体仍 200）。
    */
-  pageReadMany(
+  async pageReadMany(
     serviceId: string,
     teamId: string,
     wikiId: string,
     refs: string[],
-  ): WriteOutcome<PageReadItem[]> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  ): Promise<WriteOutcome<PageReadItem[]>> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (refs.length > PAGE_READ_MAX) {
       throw new Error(`refs exceeds max ${PAGE_READ_MAX}`);
@@ -954,14 +944,14 @@ export class WikiService {
    * - 结构性文件 → "forbidden_path"
    * - 超 512KB → "too_large"
    */
-  pageWrite(
+  async pageWrite(
     serviceId: string,
     teamId: string,
     wikiId: string,
     ref: string,
     content: string,
-  ): WriteOutcome<PageWriteResult> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  ): Promise<WriteOutcome<PageWriteResult>> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (row.status === "processing") return "processing";
 
@@ -987,13 +977,13 @@ export class WikiService {
    *   结构性文件 → "forbidden_path"；超 512KB → "too_large"
    * - 全部通过后逐文件落盘；任一失败回滚已写文件。
    */
-  pageWriteMany(
+  async pageWriteMany(
     serviceId: string,
     teamId: string,
     wikiId: string,
     pages: { ref: string; content: string }[],
-  ): WriteOutcome<PageWriteManyItem[]> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  ): Promise<WriteOutcome<PageWriteManyItem[]>> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (row.status === "processing") return "processing";
     if (pages.length > PAGE_WRITE_MAX) {
@@ -1065,7 +1055,7 @@ export class WikiService {
     wikiId: string,
     refs: string[],
   ): Promise<WriteOutcome<PageRmResult>> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (row.status === "processing") return "processing";
     if (refs.length > PAGE_RM_MAX) {
@@ -1235,12 +1225,13 @@ export class WikiService {
 
   // ═══════════════════════════════════════════════════════════════════
 
-  private enqueueBuild(row: WikiRow): void {
+  private enqueueBuild(row: WikiRow, runId: string): void {
     // 代际 version 随任务一起入队：runBuild 用它与 cancelled 标记比对，
     // 使 replace 新入队的任务（version 更大）不会被旧代际的标记误伤。
+    // runId = claim 写入的 build_run_id：本次 build 的每次状态写入都以它为栅栏。
     const version = row.version;
     this.queue.enqueue(row.wiki_id, () =>
-      this.runBuild(row.service_id, row.wiki_id, row.team_id, row.name, version),
+      this.runBuild(row.service_id, row.wiki_id, row.team_id, row.name, version, runId),
     );
   }
 
@@ -1250,22 +1241,50 @@ export class WikiService {
     teamId: string,
     name: string,
     version: number,
+    runId: string,
   ): Promise<void> {
+    // 本次 build 的写栅栏：行的 build_run_id 不再等于 runId（被 replace / 删除 / 重启恢复）
+    // 时，任何写入都匹配 0 行。
+    const fence = { runId };
+    const abort = async (): Promise<void> => {
+      await this.finishCancelled(serviceId, teamId, wikiId, runId, {
+        preserveRaw: await this.isCancelledByReplace(serviceId, wikiId),
+      });
+    };
+
     // 入口检查点：pending 期间被中止 → 跳过，不置 processing、不 ingest。
     // preserveRaw 由触发源决定：replace（行仍在）保留 raw，delete（行已删）硬删。
-    if (this.isDeleted(serviceId, wikiId, version)) {
-      this.finishCancelled(serviceId, teamId, wikiId, {
-        preserveRaw: this.isCancelledByReplace(serviceId, wikiId),
-      });
+    if (await this.isDeleted(serviceId, wikiId, version)) {
+      await abort();
       return;
     }
-    this.store.updateWikiStatus(serviceId, wikiId, {
-      status: "processing",
-      internal_status: "scanning",
-      sync_error: null,
-    });
-    // 进度/终态 callback 共用同一代际，Panel 可拒绝 clear 后的迟到 progress
-    const ingestRunId = randomUUID();
+    const started = await this.store.updateWikiStatus(
+      serviceId,
+      wikiId,
+      { status: "processing", internal_status: "scanning", sync_error: null },
+      fence,
+    );
+    if (!started) {
+      // 行已被删除、被新 claim 接管或被恢复置 failed：本 run 不再拥有该行。
+      this.logger?.info?.(`[wiki] ${wikiId} build ${runId} superseded before start, skipped`);
+      return;
+    }
+
+    // 进度写入按序串到本 build 的 promise 链上。setInternalStatus 对 worker
+    // 保持 void，且永不 reject（失败只记日志）；终态写入前 await 整条链。
+    let progress: Promise<void> = Promise.resolve();
+    const setInternalStatus = (s: string): void => {
+      progress = progress
+        .then(async () => {
+          await this.store.updateWikiStatus(serviceId, wikiId, { status: "processing", internal_status: s }, fence);
+        })
+        .catch((err: unknown) => {
+          this.logger?.warn?.(`[wiki] ${wikiId} progress write '${s}' failed: ${String(err)}`);
+        });
+    };
+
+    // 进度/终态 callback 共用同一代际（= build_run_id），Panel 可拒绝 clear 后的迟到 progress
+    const ingestRunId = runId;
     try {
       const result = await this.worker({
         wikiId,
@@ -1273,27 +1292,35 @@ export class WikiService {
         teamId,
         name,
         dir: this.dirFor(serviceId, teamId, wikiId),
-        setInternalStatus: (s) =>
-          this.store.updateWikiStatus(serviceId, wikiId, { status: "processing", internal_status: s }),
+        setInternalStatus,
         ingestRunId,
       });
+      await progress;
       // 结束前检查点：processing 期间被中止 → 跳过 ready/audit/回调，幂等收尾。
-      if (this.isDeleted(serviceId, wikiId, version)) {
-        this.finishCancelled(serviceId, teamId, wikiId, {
-          preserveRaw: this.isCancelledByReplace(serviceId, wikiId),
-        });
+      if (await this.isDeleted(serviceId, wikiId, version)) {
+        await abort();
         return;
       }
-      this.store.updateWikiStatus(serviceId, wikiId, {
-        status: "ready",
-        internal_status: null,
-        sync_error: null,
-        page_count: result?.pageCount ?? null,
-        last_sync_at: new Date().toISOString(),
-      });
-      const synced = this.store.getWikiById(serviceId, wikiId);
+      const wrote = await this.store.updateWikiStatus(
+        serviceId,
+        wikiId,
+        {
+          status: "ready",
+          internal_status: null,
+          sync_error: null,
+          page_count: result?.pageCount ?? null,
+          last_sync_at: new Date().toISOString(),
+          build_run_id: null,
+        },
+        fence,
+      );
+      if (!wrote) {
+        this.logger?.info?.(`[wiki] ${wikiId} build ${runId} superseded, ready write skipped`);
+        return;
+      }
+      const synced = await this.store.getWikiById(serviceId, wikiId);
       if (synced) {
-        this.audit(synced, "ready", result?.pageCount != null ? `pages: ${result.pageCount}` : null);
+        await this.audit(synced, "ready", result?.pageCount != null ? `pages: ${result.pageCount}` : null);
       }
       this.logger?.info?.(`[wiki] ${wikiId} ready (pages: ${result?.pageCount ?? '?'})`);
 
@@ -1301,20 +1328,24 @@ export class WikiService {
       await this.onBuildComplete(synced, "ready", null, ingestRunId);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      await progress;
       // worker 抛错，但若期间已被中止，视为取消而非失败：跳过 failed 状态/回调，做收尾。
-      if (this.isDeleted(serviceId, wikiId, version)) {
-        this.finishCancelled(serviceId, teamId, wikiId, {
-          preserveRaw: this.isCancelledByReplace(serviceId, wikiId),
-        });
+      if (await this.isDeleted(serviceId, wikiId, version)) {
+        await abort();
         return;
       }
-      this.store.updateWikiStatus(serviceId, wikiId, {
-        status: "failed",
-        internal_status: null,
-        sync_error: msg.slice(0, 500),
-      });
-      const failed = this.store.getWikiById(serviceId, wikiId);
-      if (failed) this.audit(failed, "failed", msg.slice(0, 500));
+      const wrote = await this.store.updateWikiStatus(
+        serviceId,
+        wikiId,
+        { status: "failed", internal_status: null, sync_error: msg.slice(0, 500), build_run_id: null },
+        fence,
+      );
+      if (!wrote) {
+        this.logger?.info?.(`[wiki] ${wikiId} build ${runId} superseded, failed write skipped: ${msg}`);
+        return;
+      }
+      const failed = await this.store.getWikiById(serviceId, wikiId);
+      if (failed) await this.audit(failed, "failed", msg.slice(0, 500));
       this.logger?.warn?.(`[wiki] ${wikiId} failed: ${msg}`);
 
       // Callback TMC about failure
@@ -1339,18 +1370,20 @@ export class WikiService {
     if (status === "ready") {
       // Generate summary via LLM (即使部分源失败也尝试生成——只要有页面就生成)
       try {
-        const pages = this.pageLs(row.service_id, row.team_id, row.wiki_id) ?? [];
+        const pages = (await this.pageLs(row.service_id, row.team_id, row.wiki_id)) ?? [];
         this.logger?.info?.(`[wiki] summary generation start (wikiId=${row.wiki_id}, pages=${pages.length}, status=${status})`);
         const { generateWikiSummary } = await import("../callback.js");
         summary = await generateWikiSummary(
           row.wiki_id,
           row.name,
           pages.map((p) => ({ title: p.title, description: p.description })),
-          this.callbackConfig.resolveLlm(row.service_id),
+          await this.callbackConfig.resolveLlm(row.service_id),
         );
         this.logger?.info?.(`[wiki] summary generation done (wikiId=${row.wiki_id}, len=${summary?.length ?? 0}, empty=${!summary})`);
         if (summary) {
-          this.store.updateWikiStatus(row.service_id, row.wiki_id, { summary });
+          // Fence: the terminal write cleared build_run_id; a newer claim sets it again,
+          // so the summary lands only while no newer build owns the row.
+          await this.store.updateWikiStatus(row.service_id, row.wiki_id, { summary }, { runId: null });
         }
       } catch (err) {
         this.logger?.warn?.(`[wiki] summary generation failed: ${String(err)}`);

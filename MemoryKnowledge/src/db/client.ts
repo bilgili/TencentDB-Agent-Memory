@@ -1,22 +1,224 @@
 /**
- * Drizzle client initialization — creates better-sqlite3 Database + drizzle wrapper.
+ * Central knowledge DB: dialect seam.
  *
- * Synchronous driver, matches existing store call patterns.
+ * `createKnowledgeDb(config)` opens SQLite (better-sqlite3) or Postgres (pg pool)
+ * and returns a discriminated union. Only this file and the dialect stores touch
+ * a driver; module.ts picks the stores from `dialect`.
+ *
+ * Startup order — the caller keeps it:
+ *   1. createKnowledgeDb  — open; on Postgres also take the schema lock (step 2)
+ *   3. migrateKnowledgeDb — versioned migrations
+ *   4/5. recovery + restore (createKnowledgeModule), 6. serve()
  */
 
 import Database from "better-sqlite3";
 import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+import { drizzle as drizzlePg, type NodePgDatabase } from "drizzle-orm/node-postgres";
+import pg from "pg";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import * as schema from "./schema.js";
+import { createLogger } from "../logger.js";
+import { PG_MIGRATIONS } from "./migrations/pg.js";
+import { SQLITE_MIGRATIONS } from "./migrations/sqlite.js";
+import { createPgTables, type PgTables } from "./schema.pg.js";
+import * as schema from "./schema.sqlite.js";
+
+const log = createLogger("knowledge-db");
 
 export type Db = BetterSQLite3Database<typeof schema>;
+export type PgDb = NodePgDatabase;
+
+// Advisory lock classes, first key of the two-key form. The owner is
+// MemoryCore/src/core/store/postgres/tx.ts (LOCK_CLASS_*): keep these values
+// identical so MemoryCore and MemoryKnowledge locks never share a key.
+export const LOCK_CLASS_MIGRATE = 0x7464_0002;
+export const LOCK_CLASS_KNOWLEDGE_SINGLETON = 0x7464_0004;
+/** DDL lock wait limit. */
+const MIGRATION_LOCK_TIMEOUT = "30s";
+
+// ───────────────────────── Config ─────────────────────────
+
+export interface KnowledgeDbConfig {
+  /** SQLite file (KNOWLEDGE_DB_PATH); used when `url` is empty. ":memory:" for tests. */
+  path: string;
+  /** KNOWLEDGE_DB_URL — a postgres:// or postgresql:// URL selects Postgres. */
+  url?: string;
+  /** KNOWLEDGE_DB_SCHEMA — Postgres schema. Default "knowledge". */
+  schema?: string;
+  /** KNOWLEDGE_DB_POOL_MAX — Postgres pool size. Default 10. */
+  poolMax?: number;
+}
+
+const SCHEMA_RE = /^[a-z_][a-z0-9_]{0,62}$/;
+
+/** Throws unless `name` is a safe, non-reserved schema name. */
+export function assertKnowledgeSchemaName(name: string): void {
+  // "public": Drizzle cannot qualify it (pgSchema rejects it), and every SQL must be schema-qualified.
+  if (!SCHEMA_RE.test(name) || name.startsWith("pg_") || name === "public") {
+    throw new Error(
+      `KNOWLEDGE_DB_SCHEMA "${name}" is invalid: use ^[a-z_][a-z0-9_]{0,62}$, not pg_* and not public`,
+    );
+  }
+}
+
+/** Remove the password from a connection URL before it is logged. */
+export function redactUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.password) u.password = "***";
+    if (u.searchParams.has("password")) u.searchParams.set("password", "***");
+    return u.toString();
+  } catch {
+    return url.replace(/\/\/([^/@:]*):[^@/]*@/, "//$1:***@").replace(/([?&]password=)[^&]*/i, "$1***");
+  }
+}
+
+function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+// ───────────────────────── Dialect union ─────────────────────────
+
+export type KnowledgeDb =
+  | { dialect: "sqlite"; db: Db; raw: Database.Database; close(): Promise<void> }
+  | {
+      dialect: "postgres";
+      db: PgDb;
+      tables: PgTables;
+      schema: string;
+      pool: pg.Pool;
+      /** Dedicated connection outside the pool that holds the schema lock. */
+      lockClient: pg.Client;
+      close(): Promise<void>;
+    };
+
+export interface CreateKnowledgeDbOptions {
+  /**
+   * Called once when the Postgres lock connection fails or ends while the
+   * process runs (the lock is then released). Default: log and exit(1) —
+   * fail-stop. Tests inject a spy.
+   */
+  onLockLost?: (err: Error) => void;
+  /**
+   * Interval of the `SELECT 1` heartbeat on the lock connection. A failed
+   * heartbeat counts as a lost lock. Default 30s; tests inject a short one.
+   */
+  lockHeartbeatMs?: number;
+}
+
+const LOCK_HEARTBEAT_MS = 30_000;
+/** A heartbeat on a half-open connection would otherwise hang instead of failing. */
+const LOCK_QUERY_TIMEOUT_MS = 10_000;
+
+/**
+ * Open the central DB. On Postgres this also takes the schema lock
+ * and rejects when another process holds it. Does not run migrations.
+ */
+export async function createKnowledgeDb(
+  config: KnowledgeDbConfig,
+  opts: CreateKnowledgeDbOptions = {},
+): Promise<KnowledgeDb> {
+  const url = config.url?.trim();
+  if (!url) {
+    const { db, raw } = createDb({ path: config.path, autoMigrate: false });
+    return { dialect: "sqlite", db, raw, close: async () => void raw.close() };
+  }
+
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1]?.toLowerCase();
+  if (scheme !== "postgres" && scheme !== "postgresql") {
+    throw new Error(
+      `KNOWLEDGE_DB_URL scheme "${scheme ?? "(none)"}" is not supported: use postgres:// or postgresql://`,
+    );
+  }
+  const schemaName = config.schema ?? "knowledge";
+  assertKnowledgeSchemaName(schemaName);
+  const poolMax = config.poolMax ?? 10;
+  if (!Number.isInteger(poolMax) || poolMax < 1) {
+    throw new Error(`KNOWLEDGE_DB_POOL_MAX must be a positive integer (got ${poolMax})`);
+  }
+  const onLockLost =
+    opts.onLockLost ??
+    ((err: Error) => {
+      log.error(`lost the Postgres schema lock for "${schemaName}"; stopping (fail-stop)`, { error: err.message });
+      process.exit(1);
+    });
+
+  const pool = new pg.Pool({ connectionString: url, max: poolMax });
+  // An idle pooled client can fail (server restart); without a listener that kills the process.
+  pool.on("error", (err) => log.warn("idle Postgres pool client error", { error: err.message }));
+
+  // step 2: session lock on a dedicated client, never a pooled one (the pool
+  // closes idle clients, which would release the lock).
+  // keepAlive + the heartbeat below detect a silently dead connection (the lock
+  // is gone with it) instead of waiting for the next write to fail.
+  const lockClient = new pg.Client({ connectionString: url, keepAlive: true, query_timeout: LOCK_QUERY_TIMEOUT_MS });
+  let armed = false;
+  let closing = false;
+  let heartbeat: NodeJS.Timeout | undefined;
+  const lost = (err?: Error) => {
+    if (!armed || closing) return;
+    armed = false;
+    clearInterval(heartbeat);
+    onLockLost(err ?? new Error("lock connection ended"));
+  };
+  lockClient.on("error", lost);
+  lockClient.on("end", () => lost());
+
+  try {
+    await lockClient.connect();
+    const { rows } = await lockClient.query<{ locked: boolean }>(
+      "SELECT pg_try_advisory_lock($1, hashtext($2)) AS locked",
+      [LOCK_CLASS_KNOWLEDGE_SINGLETON, schemaName],
+    );
+    if (!rows[0]?.locked) {
+      throw new Error(
+        `another MemoryKnowledge process holds the Postgres schema "${schemaName}" ` +
+          `(${redactUrl(url)}); only one process per schema is supported`,
+      );
+    }
+  } catch (err) {
+    await lockClient.end().catch(() => undefined);
+    await pool.end().catch(() => undefined);
+    throw err;
+  }
+  armed = true;
+  heartbeat = setInterval(() => {
+    lockClient.query("SELECT 1").catch((err: unknown) => lost(err instanceof Error ? err : new Error(String(err))));
+  }, opts.lockHeartbeatMs ?? LOCK_HEARTBEAT_MS);
+  heartbeat.unref();
+
+  return {
+    dialect: "postgres",
+    db: drizzlePg({ client: pool }),
+    tables: createPgTables(schemaName),
+    schema: schemaName,
+    pool,
+    lockClient,
+    async close() {
+      closing = true;
+      clearInterval(heartbeat);
+      // Pool first: no write may run after the lock is released.
+      try {
+        await pool.end();
+      } finally {
+        await lockClient.end().catch(() => undefined); // ends the session → releases the lock
+      }
+    },
+  };
+}
+
+/** Startup step 3: apply the missing versioned migrations of the DB's dialect. */
+export async function migrateKnowledgeDb(kdb: KnowledgeDb): Promise<number[]> {
+  return kdb.dialect === "sqlite" ? migrateSqlite(kdb.raw) : migratePg(kdb.pool, kdb.schema);
+}
+
+// ───────────────────────── SQLite ─────────────────────────
 
 export interface CreateDbOptions {
   /** Path to SQLite file. Use ":memory:" for in-memory DB. */
   path: string;
-  /** Whether to run migrations (CREATE TABLE IF NOT EXISTS) on init. Default true. */
+  /** Whether to run the migrations on open. Default true. */
   autoMigrate?: boolean;
 }
 
@@ -36,183 +238,77 @@ export function createDb(opts: CreateDbOptions): { db: Db; raw: Database.Databas
   const db = drizzle(raw, { schema });
 
   if (opts.autoMigrate !== false) {
-    migrate(db, raw);
+    migrateSqlite(raw);
   }
 
   return { db, raw };
 }
 
 /**
- * Run idempotent CREATE TABLE IF NOT EXISTS for all 4 tables + indexes.
- * Uses raw SQL for partial unique indexes (Drizzle schema definition generates them
- * via drizzle-kit, but for runtime we ensure tables exist).
+ * Apply the missing SQLite versions in one IMMEDIATE transaction and record
+ * them in `schema_migrations`. Returns the versions applied by this call.
  */
-export function migrate(_db: Db, raw: Database.Database): void {
-  // 前置：把老 user-scoped 凭据表清掉（新结构无法 IF NOT EXISTS 上位）。
-  // 判据：resource_id 列缺失 = 老结构，DROP 后由下方 CREATE 重建。
-  // 该能力尚未发布，无真实存量凭据。
-  if (
-    tableExists(raw, "knowledge_source_credential") &&
-    !hasColumn(raw, "knowledge_source_credential", "resource_id")
-  ) {
-    raw.exec("DROP TABLE knowledge_source_credential");
+export function migrateSqlite(raw: Database.Database): number[] {
+  return raw
+    .transaction((): number[] => {
+      raw.exec(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+      );
+      const done = new Set(raw.prepare("SELECT version FROM schema_migrations").pluck().all() as number[]);
+      const insert = raw.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)");
+      const applied: number[] = [];
+      for (const m of SQLITE_MIGRATIONS) {
+        if (done.has(m.version)) continue;
+        m.up(raw);
+        insert.run(m.version, new Date().toISOString());
+        applied.push(m.version);
+      }
+      return applied;
+    })
+    .immediate();
+}
+
+// ───────────────────────── Postgres ─────────────────────────
+
+/**
+ * one transaction — READ COMMITTED, lock_timeout, the per-schema
+ * migrate lock as the first statement that reads data, CREATE SCHEMA IF NOT
+ * EXISTS, then only the missing versions. Concurrent callers run one after the other.
+ */
+export async function migratePg(pool: pg.Pool, schemaName: string): Promise<number[]> {
+  const s = quoteIdent(schemaName);
+  const client = await pool.connect();
+  let broken: Error | undefined;
+  try {
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+    await client.query(`SET LOCAL lock_timeout = '${MIGRATION_LOCK_TIMEOUT}'`);
+    await client.query("SELECT pg_advisory_xact_lock($1, hashtext($2))", [LOCK_CLASS_MIGRATE, schemaName]);
+    await client.query(`CREATE SCHEMA IF NOT EXISTS ${s}`);
+    await client.query(
+      `CREATE TABLE IF NOT EXISTS ${s}.schema_migrations (
+         version int PRIMARY KEY,
+         applied_at timestamptz NOT NULL DEFAULT now()
+       )`,
+    );
+    const { rows } = await client.query<{ version: number }>(`SELECT version FROM ${s}.schema_migrations`);
+    const done = new Set(rows.map((r) => r.version));
+    const applied: number[] = [];
+    for (const m of PG_MIGRATIONS) {
+      if (done.has(m.version)) continue;
+      await client.query(m.up(s));
+      await client.query(`INSERT INTO ${s}.schema_migrations (version) VALUES ($1)`, [m.version]);
+      applied.push(m.version);
+    }
+    await client.query("COMMIT");
+    return applied;
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackErr) {
+      broken = rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr));
+    }
+    throw err;
+  } finally {
+    client.release(broken);
   }
-
-  raw.exec(`
-    CREATE TABLE IF NOT EXISTS knowledge_code_graph (
-      code_graph_id   TEXT PRIMARY KEY,
-      service_id      TEXT NOT NULL,
-      team_id         TEXT NOT NULL,
-      repo_name       TEXT NOT NULL DEFAULT '',
-      repo_url        TEXT NOT NULL,
-      branch          TEXT NOT NULL,
-      commit_hash     TEXT,
-      owner_user_id   TEXT,
-      user_id         TEXT,
-      agent_id        TEXT,
-      task_id         TEXT,
-      visibility      TEXT NOT NULL DEFAULT 'team',
-      status          TEXT NOT NULL DEFAULT 'pending',
-      internal_status TEXT,
-      sync_error      TEXT,
-      stats_json      TEXT,
-      version         INTEGER NOT NULL DEFAULT 0,
-      last_sync_at    TEXT,
-      created_at      TEXT NOT NULL,
-      updated_at      TEXT NOT NULL,
-      deleted_at      TEXT
-    );
-
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_kcg_team_repo_branch
-      ON knowledge_code_graph(service_id, team_id, repo_url, branch)
-      WHERE deleted_at IS NULL;
-
-    CREATE INDEX IF NOT EXISTS idx_kcg_team_status
-      ON knowledge_code_graph(service_id, team_id, status);
-
-    CREATE TABLE IF NOT EXISTS knowledge_wiki (
-      wiki_id         TEXT PRIMARY KEY,
-      service_id      TEXT NOT NULL,
-      team_id         TEXT NOT NULL,
-      name            TEXT NOT NULL,
-      source_type     TEXT,
-      source_url      TEXT,
-      owner_user_id   TEXT,
-      user_id         TEXT,
-      agent_id        TEXT,
-      task_id         TEXT,
-      visibility      TEXT NOT NULL DEFAULT 'team',
-      status          TEXT NOT NULL DEFAULT 'draft',
-      internal_status TEXT,
-      sync_error      TEXT,
-      page_count      INTEGER,
-      version         INTEGER NOT NULL DEFAULT 0,
-      last_sync_at    TEXT,
-      created_at      TEXT NOT NULL,
-      updated_at      TEXT NOT NULL,
-      deleted_at      TEXT
-    );
-
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_kwiki_team_name
-      ON knowledge_wiki(service_id, team_id, name)
-      WHERE deleted_at IS NULL;
-
-    CREATE INDEX IF NOT EXISTS idx_kwiki_team_status
-      ON knowledge_wiki(service_id, team_id, status);
-
-    CREATE TABLE IF NOT EXISTS knowledge_wiki_audit (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      wiki_id    TEXT NOT NULL,
-      service_id TEXT,
-      version    INTEGER NOT NULL DEFAULT 0,
-      action     TEXT NOT NULL,
-      user_id    TEXT,
-      agent_id   TEXT,
-      detail     TEXT,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_kwa_wiki_version
-      ON knowledge_wiki_audit(wiki_id, version DESC);
-
-    CREATE TABLE IF NOT EXISTS knowledge_code_graph_audit (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      code_graph_id TEXT NOT NULL,
-      service_id    TEXT,
-      version       INTEGER NOT NULL DEFAULT 0,
-      action        TEXT NOT NULL,
-      user_id       TEXT,
-      agent_id      TEXT,
-      detail        TEXT,
-      created_at    TEXT NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_kcga_cg_version
-      ON knowledge_code_graph_audit(code_graph_id, version DESC);
-
-    CREATE TABLE IF NOT EXISTS knowledge_source_credential (
-      service_id       TEXT NOT NULL,
-      resource_type    TEXT NOT NULL,        -- 'code-graph' | 'wiki'
-      resource_id      TEXT NOT NULL,        -- = code_graph_id 或 wiki_id
-      provider_id      TEXT NOT NULL,        -- 'gongfeng' / 'iwiki' / ...（非键）
-      cred_kind        TEXT NOT NULL,        -- 'bearer' | 'basic'
-      cred_secret      TEXT NOT NULL,        -- base64(UTF-8 令牌)
-      cred_username    TEXT,                 -- 仅 basic
-      cred_extra_json  TEXT,
-      last_verified_at TEXT,
-      created_by       TEXT,
-      updated_by       TEXT,
-      created_at       TEXT NOT NULL,
-      updated_at       TEXT NOT NULL
-    );
-
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_ksc_pk
-      ON knowledge_source_credential(service_id, resource_type, resource_id);
-
-    CREATE TABLE IF NOT EXISTS llm_binding (
-      service_id     TEXT PRIMARY KEY,
-      mode           TEXT NOT NULL DEFAULT 'proxy',
-      proxy_base_url TEXT,
-      api_key        TEXT,
-      model          TEXT,
-      base_url       TEXT,
-      enabled        INTEGER NOT NULL DEFAULT 1,
-      updated_at     TEXT NOT NULL
-    );
-  `);
-
-  // Column migrations — SQLite ALTER TABLE ADD COLUMN is not idempotent,
-  // so we check PRAGMA table_info first.
-  addColumnIfMissing(raw, "knowledge_code_graph", "service_url", "TEXT");
-  addColumnIfMissing(raw, "knowledge_code_graph", "summary", "TEXT");
-  addColumnIfMissing(raw, "knowledge_wiki", "service_url", "TEXT");
-  addColumnIfMissing(raw, "knowledge_wiki", "summary", "TEXT");
-  // service_id on audit tables is nullable → safe to add to existing dev DBs.
-  addColumnIfMissing(raw, "knowledge_wiki_audit", "service_id", "TEXT");
-  addColumnIfMissing(raw, "knowledge_code_graph_audit", "service_id", "TEXT");
-}
-
-/** True iff the given table exists in the DB. */
-function tableExists(raw: Database.Database, table: string): boolean {
-  const row = raw
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
-    .get(table);
-  return !!row;
-}
-
-/** Add a column to a table if it doesn't already exist. SQLite-safe. */
-function addColumnIfMissing(
-  raw: Database.Database,
-  table: string,
-  column: string,
-  type: string,
-): void {
-  if (hasColumn(raw, table, column)) return;
-  raw.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type};`);
-}
-
-/** True iff the given column exists on the table (SQLite PRAGMA-based). */
-function hasColumn(raw: Database.Database, table: string, column: string): boolean {
-  const cols = raw.pragma(`table_info(${table})`) as Array<{ name: string }>;
-  return cols.some((c) => c.name === column);
 }

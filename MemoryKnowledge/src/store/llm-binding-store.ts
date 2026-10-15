@@ -18,9 +18,11 @@
  */
 
 import { eq } from "drizzle-orm";
-import type { Db } from "../db/client.js";
-import { llmBinding } from "../db/schema.js";
+import type { Db, PgDb } from "../db/client.js";
+import type { PgTables } from "../db/schema.pg.js";
+import { llmBinding } from "../db/schema.sqlite.js";
 import type { LlmConfig } from "../config.js";
+import { mapLlmBindingRow } from "./rows.js";
 
 export type LlmBindingMode = "proxy" | "byo";
 
@@ -53,73 +55,104 @@ export interface LlmBindingStatus {
 }
 
 export interface ILlmBindingStore {
-  get(serviceId: string): LlmBindingRow | null;
-  listAll(): LlmBindingRow[];
-  upsert(serviceId: string, input: LlmBindingInput): LlmBindingRow;
-  status(serviceId: string): LlmBindingStatus;
+  get(serviceId: string): Promise<LlmBindingRow | null>;
+  listAll(): Promise<LlmBindingRow[]>;
+  upsert(serviceId: string, input: LlmBindingInput): Promise<LlmBindingRow>;
+  status(serviceId: string): Promise<LlmBindingStatus>;
+}
+
+/**
+ * Upsert column sets. api_key: undefined → 保留原值（仅 upsert 已存在记录时）；null → 清空；string → 更新。
+ * One statement: the "keep" case simply leaves api_key out of the conflict SET.
+ */
+function upsertSets(serviceId: string, input: LlmBindingInput) {
+  const values = {
+    serviceId,
+    mode: input.mode,
+    proxyBaseUrl: input.proxy_base_url ?? null,
+    apiKey: input.api_key ?? null,
+    baseUrl: input.base_url ?? null,
+    enabled: input.enabled === false ? 0 : 1,
+    updatedAt: new Date().toISOString(),
+  };
+  const set = {
+    mode: values.mode,
+    proxyBaseUrl: values.proxyBaseUrl,
+    ...(input.api_key !== undefined ? { apiKey: values.apiKey } : {}),
+    baseUrl: values.baseUrl,
+    enabled: values.enabled,
+    updatedAt: values.updatedAt,
+  };
+  return { values, set };
+}
+
+function toStatus(row: LlmBindingRow | null): LlmBindingStatus {
+  if (!row) return { bound: false, mode: null, enabled: false };
+  return { bound: true, mode: row.mode, enabled: row.enabled };
 }
 
 export function createLlmBindingStore(db: Db): ILlmBindingStore {
+  // Synchronous better-sqlite3 work inside async methods: each method body
+  // runs without an await, so it stays atomic.
+  const getSync = (serviceId: string): LlmBindingRow | null => {
+    const row = db.select().from(llmBinding).where(eq(llmBinding.serviceId, serviceId)).get();
+    return row ? mapLlmBindingRow(row) : null;
+  };
+
   return {
-    get(serviceId: string): LlmBindingRow | null {
-      const rows = db.select().from(llmBinding).where(eq(llmBinding.serviceId, serviceId)).all();
-      const row = rows[0];
-      return row ? toRow(row) : null;
+    async get(serviceId: string): Promise<LlmBindingRow | null> {
+      return getSync(serviceId);
     },
 
-    listAll(): LlmBindingRow[] {
-      const rows = db.select().from(llmBinding).all();
-      return rows.map(toRow);
+    async listAll(): Promise<LlmBindingRow[]> {
+      return db.select().from(llmBinding).all().map(mapLlmBindingRow);
     },
 
-    upsert(serviceId: string, input: LlmBindingInput): LlmBindingRow {
-      const now = new Date().toISOString();
-      const existing = this.get(serviceId);
-      // api_key: undefined → 保留原值（仅 upsert 已存在记录时）；null → 清空；string → 更新
-      const apiKey = input.api_key !== undefined ? input.api_key : (existing?.api_key ?? null);
-      const values = {
-        serviceId,
-        mode: input.mode,
-        proxyBaseUrl: input.proxy_base_url ?? null,
-        apiKey,
-        baseUrl: input.base_url ?? null,
-        enabled: input.enabled === false ? 0 : 1,
-        updatedAt: now,
-      };
-      db.insert(llmBinding)
+    async upsert(serviceId: string, input: LlmBindingInput): Promise<LlmBindingRow> {
+      const { values, set } = upsertSets(serviceId, input);
+      const row = db
+        .insert(llmBinding)
         .values(values)
-        .onConflictDoUpdate({
-          target: llmBinding.serviceId,
-          set: {
-            mode: values.mode,
-            proxyBaseUrl: values.proxyBaseUrl,
-            apiKey: values.apiKey,
-            baseUrl: values.baseUrl,
-            enabled: values.enabled,
-            updatedAt: values.updatedAt,
-          },
-        })
-        .run();
-      return this.get(serviceId)!;
+        .onConflictDoUpdate({ target: llmBinding.serviceId, set })
+        .returning()
+        .get();
+      return mapLlmBindingRow(row);
     },
 
-    status(serviceId: string): LlmBindingStatus {
-      const row = this.get(serviceId);
-      if (!row) return { bound: false, mode: null, enabled: false };
-      return { bound: true, mode: row.mode, enabled: row.enabled };
+    async status(serviceId: string): Promise<LlmBindingStatus> {
+      return toStatus(getSync(serviceId));
     },
   };
 }
 
-function toRow(r: typeof llmBinding.$inferSelect): LlmBindingRow {
+/** Postgres twin of createLlmBindingStore; same statements. */
+export function createPgLlmBindingStore(db: PgDb, tables: PgTables): ILlmBindingStore {
+  const t = tables.llmBinding;
+  const get = async (serviceId: string): Promise<LlmBindingRow | null> => {
+    const [row] = await db.select().from(t).where(eq(t.serviceId, serviceId));
+    return row ? mapLlmBindingRow(row) : null;
+  };
+
   return {
-    service_id: r.serviceId,
-    mode: (r.mode === "byo" ? "byo" : "proxy") as LlmBindingMode,
-    proxy_base_url: r.proxyBaseUrl ?? null,
-    api_key: r.apiKey ?? null,
-    base_url: r.baseUrl ?? null,
-    enabled: r.enabled !== 0,
-    updated_at: r.updatedAt,
+    get,
+
+    async listAll(): Promise<LlmBindingRow[]> {
+      return (await db.select().from(t)).map(mapLlmBindingRow);
+    },
+
+    async upsert(serviceId: string, input: LlmBindingInput): Promise<LlmBindingRow> {
+      const { values, set } = upsertSets(serviceId, input);
+      const [row] = await db
+        .insert(t)
+        .values(values)
+        .onConflictDoUpdate({ target: t.serviceId, set })
+        .returning();
+      return mapLlmBindingRow(row!);
+    },
+
+    async status(serviceId: string): Promise<LlmBindingStatus> {
+      return toStatus(await get(serviceId));
+    },
   };
 }
 

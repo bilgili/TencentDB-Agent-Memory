@@ -62,7 +62,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     const wikiId = body.wiki_id;
     if (!isValidIdSegment(wikiId)) return c.json(wrapError(400, "wiki_id is required"), 400);
 
-    const row = wikiService.getById(serviceId, wikiId);
+    const row = await wikiService.getById(serviceId, wikiId);
     if (!row) return c.json(wrapError(404, "wiki not found"), 404);
     return c.json(wrapOk(toWikiDetail(row)));
   });
@@ -78,16 +78,16 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     // 'replace' 由 Panel 复合端点专用（取消旧任务 + 排队新任务）。
     const onBusy = body.on_busy === "replace" ? "replace" : "reject";
 
-    const row = wikiService.getById(serviceId, wikiId);
+    const row = await wikiService.getById(serviceId, wikiId);
     if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
     // 空 wiki 禁止 ingest：无源文件时拒绝（避免静默成功 pageCount=0）
-    const sources = wikiService.rawLs(serviceId, row.team_id, wikiId);
+    const sources = await wikiService.rawLs(serviceId, row.team_id, wikiId);
     if (!sources || sources.length === 0) {
       return c.json(wrapError(400, "wiki has no source files, upload before ingest"), 400);
     }
 
-    const result = wikiService.ingest(serviceId, row.team_id, wikiId, requesterUserId, { onBusy });
+    const result = await wikiService.ingest(serviceId, row.team_id, wikiId, requesterUserId, { onBusy });
     if (result.kind === "not_found") return c.json(wrapError(404, "wiki not found"), 404);
     if (result.kind === "busy") {
       // 并发拒绝：干净最小的 409 响应体（调用方用 code 判断，不 parse message）。
@@ -122,12 +122,12 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
         result.failed.push({ id: String(id), reason: "invalid id" });
         continue;
       }
-      const row = wikiService.getById(serviceId, id);
+      const row = await wikiService.getById(serviceId, id);
       if (!row) {
         result.failed.push({ id, reason: "not found" });
         continue;
       }
-      const ok = wikiService.delete(serviceId, row.team_id, id);
+      const ok = await wikiService.delete(serviceId, row.team_id, id);
       if (ok) {
         // wiki engine manager 注册清理仍由路由负责（wikiMgr 未注入 service）；
         // 连接/元数据/磁盘四类清理已在 service.cleanupResources 内完成。
@@ -156,7 +156,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       return c.json(wrapError(400, "at least one of name/summary must be provided"), 400);
     }
 
-    const updated = wikiService.updateMeta(serviceId, wikiId, patch);
+    const updated = await wikiService.updateMeta(serviceId, wikiId, patch);
     if (!updated) return c.json(wrapError(404, "wiki not found"), 404);
     return c.json(wrapOk(toWikiDetail(updated)));
   });
@@ -184,7 +184,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       return c.json(wrapError(400, "source_type is required when source_url is set"), 400);
     }
 
-    const { row, existed } = wikiService.create({
+    const { row, existed } = await wikiService.create({
       service_id: ids.service_id,
       team_id: ids.team_id,
       name,
@@ -202,7 +202,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     // appends `/tools/list` | `/tools/call` directly.
     if (!existed && publicBaseUrl) {
       const serviceUrl = publicBaseUrl;
-      const updated = wikiService.updateServiceUrl(ids.service_id, row.wiki_id, serviceUrl);
+      const updated = await wikiService.updateServiceUrl(ids.service_id, row.wiki_id, serviceUrl);
       if (updated) return c.json(wrapOk(toWikiDetail(updated)), 201);
     }
 
@@ -218,8 +218,8 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     const limit = typeof body.limit === "number" ? body.limit : 20;
     const offset = typeof body.offset === "number" ? body.offset : 0;
 
-    const items = wikiService.list(ids.service_id, ids.team_id, { syncStatus: status, limit, offset });
-    const total = wikiService.count(ids.service_id, ids.team_id, status ? { syncStatus: status } : undefined);
+    const items = await wikiService.list(ids.service_id, ids.team_id, { syncStatus: status, limit, offset });
+    const total = await wikiService.count(ids.service_id, ids.team_id, status ? { syncStatus: status } : undefined);
     return c.json(wrapOk({ items: items.map(toWikiDetail), total }));
   });
 
@@ -234,10 +234,10 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     const wikiId = body.wiki_id;
     if (!isValidIdSegment(wikiId)) return c.json(wrapError(400, "wiki_id is required"), 400);
 
-    const row = wikiService.getById(serviceId, wikiId);
+    const row = await wikiService.getById(serviceId, wikiId);
     if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
-    const items = wikiService.rawLs(serviceId, row.team_id, wikiId);
+    const items = await wikiService.rawLs(serviceId, row.team_id, wikiId);
     if (items === null) return c.json(wrapError(404, "wiki not found"), 404);
     return c.json(wrapOk({ items }));
   });
@@ -257,11 +257,11 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     const wikiId = body.wiki_id;
     if (!isValidIdSegment(wikiId)) return c.json(wrapError(400, "wiki_id is required"), 400);
 
-    const row = wikiService.getById(serviceId, wikiId);
+    const row = await wikiService.getById(serviceId, wikiId);
     if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
     try {
-      const result = wikiService.rawReadMany(serviceId, row.team_id, wikiId, filenames);
+      const result = await wikiService.rawReadMany(serviceId, row.team_id, wikiId, filenames);
       const err = maybeWriteError(result);
       if (err) return err;
       return c.json(wrapOk({ items: result }));
@@ -318,7 +318,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     }
 
     try {
-      const result = wikiService.rawWriteMany(ids.service_id, ids.team_id, wikiId, validated, ids.user_id);
+      const result = await wikiService.rawWriteMany(ids.service_id, ids.team_id, wikiId, validated, ids.user_id);
       const err = maybeWriteError(result);
       if (err) return err;
       return c.json(wrapOk({ items: result }));
@@ -366,10 +366,10 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     const wikiId = body.wiki_id;
     if (!isValidIdSegment(wikiId)) return c.json(wrapError(400, "wiki_id is required"), 400);
 
-    const row = wikiService.getById(serviceId, wikiId);
+    const row = await wikiService.getById(serviceId, wikiId);
     if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
-    const items = wikiService.pageLs(serviceId, row.team_id, wikiId);
+    const items = await wikiService.pageLs(serviceId, row.team_id, wikiId);
     if (items === null) return c.json(wrapError(404, "wiki not found"), 404);
     return c.json(wrapOk({ items }));
   });
@@ -389,11 +389,11 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     const wikiId = body.wiki_id;
     if (!isValidIdSegment(wikiId)) return c.json(wrapError(400, "wiki_id is required"), 400);
 
-    const row = wikiService.getById(serviceId, wikiId);
+    const row = await wikiService.getById(serviceId, wikiId);
     if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
     try {
-      const result = wikiService.pageReadMany(serviceId, row.team_id, wikiId, refs);
+      const result = await wikiService.pageReadMany(serviceId, row.team_id, wikiId, refs);
       const err = maybeWriteError(result);
       if (err) return err;
       return c.json(wrapOk({ items: result }));
@@ -433,7 +433,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     }
 
     try {
-      const result = wikiService.pageWriteMany(ids.service_id, ids.team_id, wikiId, validated);
+      const result = await wikiService.pageWriteMany(ids.service_id, ids.team_id, wikiId, validated);
       const err = maybeWriteError(result);
       if (err) return err;
       try { wikiMgr.sync(wikiId); } catch (e) { console.warn(`[wiki] wikiMgr.sync(${wikiId}) failed after page/write:`, e); }
@@ -480,7 +480,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     const wikiId = body.wiki_id;
     if (!isValidIdSegment(wikiId)) return c.json(wrapError(400, "wiki_id is required"), 400);
 
-    const row = wikiService.getById(serviceId, wikiId);
+    const row = await wikiService.getById(serviceId, wikiId);
     if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
     if (row.status !== "ready") {
@@ -500,7 +500,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     const wikiId = body.wiki_id;
     if (!isValidIdSegment(wikiId)) return c.json(wrapError(400, "wiki_id is required"), 400);
 
-    const row = wikiService.getById(serviceId, wikiId);
+    const row = await wikiService.getById(serviceId, wikiId);
     if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
     if (row.status !== "ready") {

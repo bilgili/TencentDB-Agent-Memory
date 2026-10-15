@@ -76,6 +76,7 @@ import { DEFAULT_GROUP_NAME, InstanceUpstreamWriteConflictError } from "../types
 import { DEFAULT_PAGINATION } from "../pagination.js";
 import { buildChatMemoryAssetId } from "../utils/chat-memory-asset.js";
 import { DuplicateUserKeyError } from "./interface.js";
+import { isUniqueViolation } from "../../core/store/errors.js";
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -85,10 +86,9 @@ const PK_RETRY_LIMIT = 3;
 
 /** Returns true if the error is a MongoDB E11000 duplicate key on a primary key (xxx_id) field. */
 function isPkCollision(err: unknown): boolean {
-  if (typeof err !== "object" || err === null) return false;
-  const e = err as { code?: number; keyPattern?: Record<string, unknown> };
-  if (e.code !== 11000) return false;
-  const keys = e.keyPattern ? Object.keys(e.keyPattern) : [];
+  if (!isUniqueViolation(err)) return false;
+  const keyPattern = (err as { keyPattern?: Record<string, unknown> }).keyPattern;
+  const keys = keyPattern ? Object.keys(keyPattern) : [];
   return keys.some((k) => k.endsWith("_id") && k !== "_id");
 }
 
@@ -98,9 +98,8 @@ function isStorePkCollision(err: unknown): boolean {
 
 /** E11000 on meta_user_keys.key_value (调用方显式指定 default_key_value 时并发命中)。 */
 function isUserKeyValueCollision(err: unknown): boolean {
-  if (typeof err !== "object" || err === null) return false;
-  const e = err as { code?: number; keyPattern?: Record<string, unknown> };
-  return e.code === 11000 && !!e.keyPattern && "key_value" in e.keyPattern;
+  const keyPattern = (err as { keyPattern?: Record<string, unknown> } | null)?.keyPattern;
+  return isUniqueViolation(err) && !!keyPattern && "key_value" in keyPattern;
 }
 
 const PROJECT_NO_ID = { projection: { _id: 0 } } as const;

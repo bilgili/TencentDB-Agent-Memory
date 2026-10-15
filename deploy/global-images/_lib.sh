@@ -150,6 +150,77 @@ print_endpoints() {
 }
 
 # ═══════════════════════════════════════════════════════════════
+# PostgreSQL 后端（试验特性）：memory-core 与 memory-hub 共用同一个 Postgres
+# ═══════════════════════════════════════════════════════════════
+
+# redact_url <url>：把 URL 里的密码替换为 ****，用于日志输出。
+#   密码可能含 @：贪婪匹配到 host 前的最后一个 @（authority 在第一个 / ? # 处结束）。
+redact_url() {
+  printf '%s' "$1" | sed -E 's|(://[^:/@]+):[^/?#]*@|\1:****@|'
+}
+
+# ensure_postgres_url
+#   保证变量 POSTGRES_URL 非空。
+#     POSTGRES_URL 已设   → 用外部 Postgres（15+，带 pgvector >= 0.8.0），不起容器；
+#     POSTGRES_URL 未设   → 在 tdai-memory-stack 网络里起一个 pgvector 容器
+#                           （数据卷 postgres-local-data 持久化，不映射宿主端口）。
+#   本地容器的超级用户由镜像创建，所以这里一次性执行 CREATE EXTENSION vector
+#   （pgvector 0.8.0 不是 trusted 扩展，普通角色不能自己建）。
+#   幂等：容器已在跑就只补一次 ready 检查。密码首次生成后写回 .env，
+#   因为数据卷里的密码在首次 initdb 时就固定了，重建容器不能换密码。
+ensure_postgres_url() {
+  [[ -n "${POSTGRES_URL:-}" ]] && return 0
+
+  local container="${POSTGRES_LOCAL_CONTAINER:-tdai-postgres-local}"
+  local image="${POSTGRES_LOCAL_IMAGE:-pgvector/pgvector:0.8.0-pg17}"
+  local volume="${POSTGRES_LOCAL_VOLUME:-postgres-local-data}"
+  local network=tdai-memory-stack
+  local db="${POSTGRES_LOCAL_DB:-tdai_memory}"
+  local user=tdai
+
+  if ! $DOCKER network inspect "$network" >/dev/null 2>&1; then
+    info "创建 docker 网络 $network"
+    $DOCKER network create "$network" >/dev/null
+  fi
+
+  if [[ -z "${POSTGRES_LOCAL_PASSWORD:-}" ]]; then
+    if command -v openssl >/dev/null 2>&1; then
+      POSTGRES_LOCAL_PASSWORD="$(openssl rand -hex 16)"
+    else
+      POSTGRES_LOCAL_PASSWORD="$(head -c 16 /dev/urandom | od -A n -t x1 | tr -d ' \n')"
+    fi
+    [[ -f "$ENV_FILE" ]] && set_env_value POSTGRES_LOCAL_PASSWORD "$POSTGRES_LOCAL_PASSWORD" "$ENV_FILE"
+    info "已生成 POSTGRES_LOCAL_PASSWORD 并写回 ${ENV_FILE}"
+  fi
+
+  info "未设 POSTGRES_URL → 启动本地 Postgres（${image}）"
+  if ! $DOCKER ps --format '{{.Names}}' 2>/dev/null | grep -qx "$container"; then
+    rm_container_if_exists "$container"
+    # 编码/区域固定为 UTF-8：全文检索的中日韩分词依赖 UTF-8 数据库。
+    # healthcheck 走 TCP（-h 127.0.0.1）：initdb 期间的临时服务只听 unix socket，
+    # 走 socket 会在真正的服务启动前误报 ready。
+    $DOCKER run -d --name "$container" \
+      --network "$network" \
+      --network-alias tdai-postgres \
+      -e POSTGRES_USER="$user" \
+      -e POSTGRES_PASSWORD="$POSTGRES_LOCAL_PASSWORD" \
+      -e POSTGRES_DB="$db" \
+      -e POSTGRES_INITDB_ARGS="--encoding=UTF8 --locale=C.UTF-8" \
+      -v "${volume}:/var/lib/postgresql/data" \
+      --health-cmd "pg_isready -h 127.0.0.1 -U ${user} -d ${db}" \
+      --health-interval 3s --health-timeout 3s --health-retries 20 --health-start-period 5s \
+      "$image" >/dev/null
+  fi
+  wait_healthy "$container" 90
+
+  $DOCKER exec "$container" psql -v ON_ERROR_STOP=1 -U "$user" -d "$db" \
+    -c 'CREATE EXTENSION IF NOT EXISTS vector' >/dev/null \
+    || die "CREATE EXTENSION vector 失败，docker logs $container 排查"
+  ok "postgres 就绪（容器 ${container}，网络内别名 tdai-postgres，库 ${db}，已启用 pgvector）"
+  POSTGRES_URL="postgres://${user}:${POSTGRES_LOCAL_PASSWORD}@tdai-postgres:5432/${db}"
+}
+
+# ═══════════════════════════════════════════════════════════════
 # LLM 通路检查（与 verify.sh 同源逻辑；供 start-all.sh 交互式流程复用）
 # ═══════════════════════════════════════════════════════════════
 
@@ -313,7 +384,8 @@ set_env_value() {
   local key="$1" value="$2" file="$3"
   if grep -qE "^[[:space:]]*${key}=" "$file"; then
     local tmp="$file.tmp.$$"
-    awk -v k="$key" -v v="$value" '
+    # .env 含密钥：临时文件先复制原文件（cp -p 保留权限位），再覆写内容，mv 后权限不变。
+    cp -p "$file" "$tmp" && awk -v k="$key" -v v="$value" '
       $0 ~ ("^[[:space:]]*" k "=") { print k "=" v; next }
       { print }
     ' "$file" > "$tmp" && mv "$tmp" "$file"

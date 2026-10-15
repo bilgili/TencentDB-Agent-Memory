@@ -99,6 +99,25 @@ export function buildFtsQuery(raw: string): string | null {
 }
 
 /**
+ * Build a Postgres `tsquery` string from keyword tokens.
+ *
+ * The Postgres counterpart of {@link buildFtsQuery}: same tokens (pass the
+ * output of {@link extractQueryTokens}), exact lexemes OR-ed together. Each
+ * token is one quoted lexeme with `'` and `\` doubled, so no token can inject
+ * tsquery operators (`& | ! <-> :*`). No `:*` prefix match — buildFtsQuery
+ * matches exact tokens and a prefix match would change recall.
+ *
+ * The store binds the result as a parameter: `to_tsquery('simple', $1)`.
+ * Returns `null` when there is no token.
+ */
+export function buildPgTsQuery(tokens: readonly string[]): string | null {
+  const lexemes = tokens
+    .filter((t) => t.length > 0)
+    .map((t) => `'${t.replaceAll("\\", "\\\\").replaceAll("'", "''")}'`);
+  return lexemes.length > 0 ? lexemes.join(" | ") : null;
+}
+
+/**
  * Return the raw keyword tokens (de-duplicated, stop-word filtered) for a query.
  *
  * Unlike {@link buildFtsQuery} (which produces FTS5 MATCH syntax), this yields

@@ -29,6 +29,7 @@ import type {
   SkillConfigInput,
   SkillDegradation,
   SkillEnvProbe,
+  SkillStoreBackend,
 } from "./types.js";
 
 export interface ResolverLogger {
@@ -74,7 +75,7 @@ export function resolveSkillConfig(
   // --------------- store ---------------
   const requestedStore =
     input.storeBackend ?? probe.outerStoreBackend ?? "sqlite";
-  let storeBackend: "sqlite" | "tcvdb" | "mongodb" = requestedStore;
+  let storeBackend: SkillStoreBackend = requestedStore;
   if (storeBackend === "tcvdb" && !probe.hasTcvdbCredentials) {
     degradations.push({
       field: "storeBackend",

@@ -14,13 +14,14 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import type { DbKind } from "../core/backend-selection/types.js";
 
 // ============================
 // Types
 // ============================
 
 export interface ManifestStoreInfo {
-  type: "sqlite" | "tcvdb" | "mongodb";
+  type: DbKind;
   sqlite?: {
     /** Relative path to the SQLite DB file (relative to dataDir). */
     path: string;
@@ -34,6 +35,11 @@ export interface ManifestStoreInfo {
   mongodb?: {
     endpoint: string;
     database: string;
+  };
+  postgres?: {
+    /** Connection URL with the password redacted (`redactUrl`). */
+    url: string;
+    schema: string;
   };
 }
 
@@ -105,13 +111,16 @@ export function writeManifest(dataDir: string, manifest: Manifest): void {
 // ============================
 
 export interface StoreConfigSnapshot {
-  type: "sqlite" | "tcvdb" | "mongodb";
+  type: DbKind;
   sqlitePath?: string;
   tcvdbUrl?: string;
   tcvdbDatabase?: string;
   tcvdbAlias?: string;
   mongoEndpoint?: string;
   mongoDatabase?: string;
+  /** Redacted Postgres URL — never the raw URL (it can carry a password). */
+  postgresUrl?: string;
+  postgresSchema?: string;
 }
 
 /**
@@ -119,19 +128,30 @@ export interface StoreConfigSnapshot {
  */
 export function buildStoreInfo(snapshot: StoreConfigSnapshot): ManifestStoreInfo {
   const info: ManifestStoreInfo = { type: snapshot.type };
-  if (snapshot.type === "sqlite") {
-    info.sqlite = { path: snapshot.sqlitePath ?? "vectors.db" };
-  } else if (snapshot.type === "mongodb") {
-    info.mongodb = {
-      endpoint: snapshot.mongoEndpoint!,
-      database: snapshot.mongoDatabase!,
-    };
-  } else {
-    info.tcvdb = {
-      url: snapshot.tcvdbUrl!,
-      database: snapshot.tcvdbDatabase!,
-      alias: snapshot.tcvdbAlias || undefined,
-    };
+  switch (snapshot.type) {
+    case "sqlite":
+      info.sqlite = { path: snapshot.sqlitePath ?? "vectors.db" };
+      break;
+    case "mongodb":
+      info.mongodb = {
+        endpoint: snapshot.mongoEndpoint!,
+        database: snapshot.mongoDatabase!,
+      };
+      break;
+    case "tcvdb":
+      info.tcvdb = {
+        url: snapshot.tcvdbUrl!,
+        database: snapshot.tcvdbDatabase!,
+        alias: snapshot.tcvdbAlias || undefined,
+      };
+      break;
+    case "postgres":
+      info.postgres = { url: snapshot.postgresUrl!, schema: snapshot.postgresSchema! };
+      break;
+    default: {
+      const unknownKind: never = snapshot.type;
+      throw new Error(`buildStoreInfo: unknown store type ${String(unknownKind)}`);
+    }
   }
   return info;
 }
@@ -172,6 +192,15 @@ export function diffStoreBinding(
     }
     if (persisted.mongodb?.database !== current.mongodb?.database) {
       diffs.push(`mongodb database changed: ${persisted.mongodb?.database} → ${current.mongodb?.database}`);
+    }
+  }
+
+  if (persisted.type === "postgres" && current.type === "postgres") {
+    if (persisted.postgres?.url !== current.postgres?.url) {
+      diffs.push(`postgres url changed: ${persisted.postgres?.url} → ${current.postgres?.url}`);
+    }
+    if (persisted.postgres?.schema !== current.postgres?.schema) {
+      diffs.push(`postgres schema changed: ${persisted.postgres?.schema} → ${current.postgres?.schema}`);
     }
   }
 

@@ -24,8 +24,8 @@ import { TdaiCore } from "../core/tdai-core.js";
 import { StandaloneHostAdapter } from "../adapters/standalone/host-adapter.js";
 import { loadGatewayConfig, parseBrokers } from "./config.js";
 import type { GatewayConfig, GatewayConfigOverrides } from "./config.js";
-import { dbChoiceToStoreConfigs, LocalBackendResolver } from "../core/backend-selection/index.js";
-import type { BackendResolver } from "../core/backend-selection/index.js";
+import { DB_TRAITS, LocalBackendResolver, parseStoreMode } from "../core/backend-selection/index.js";
+import type { BackendResolver, DbChoice } from "../core/backend-selection/index.js";
 import { applyMetadataEnvFromGatewayConfig } from "./metadata-env.js";
 import { applyTaskSourceEnvFromGatewayConfig } from "./task-source-env.js";
 import { initDataDirectories } from "../utils/pipeline-factory.js";
@@ -50,8 +50,9 @@ import type {
   GatewayErrorResponse,
 } from "./types.js";
 import type { Logger } from "../core/types.js";
+import { drainHttpServer, shutdownDrainMs } from "./drain.js";
 import { InstanceConfigProvider } from "../core/instance-config-provider.js";
-import type { VdbConfig, MongoConfig } from "../core/instance-config-provider.js";
+import type { MongoConfig } from "../core/instance-config-provider.js";
 import { wrapWithTrace } from "../core/report/trace-middleware.js";
 import { initOTelSDK, shutdownOTelSDK } from "../core/report/otel-sdk-init.js";
 import { initObservabilityBackend } from "../core/report/factory.js";
@@ -91,7 +92,9 @@ import {
   wrapApiStoreForTrace,
 } from "../api-trace/index.js";
 import { readApiTraceEnabled } from "../utils/env-config.js";
-import { readMongoEnvConfig } from "../utils/env-config.js";
+import { readMongoEnvConfig, readPostgresEnvConfig } from "../utils/env-config.js";
+import { parsePostgresSettings, redactUrl } from "../core/store/postgres/settings.js";
+import { getSharedPgPoolRegistry } from "../core/store/postgres/pool-registry.js";
 import { makeSkillRouteTable } from "./skill-handlers.js";
 import { handleV3AnalyticsRoute, createAnalyticsChClientAsync } from "./analytics/index.js";
 import type { AnalyticsChClient } from "./analytics/index.js";
@@ -513,7 +516,7 @@ export class TdaiGateway {
         this.ensureMetadataStore(instanceId),
         this.ensureMetadataStorePool(),
       ]);
-      const storeSource = pool.backend === "mongodb" ? "mongodb-adapter.ts" : "sqlite-adapter.ts";
+      const storeSource = `${pool.backend}-adapter.ts`;
       const rawSvc = new MetadataService(
         wrapApiStoreForTrace(store, storeSource),
         instanceId,
@@ -856,6 +859,21 @@ export class TdaiGateway {
   private async doStop(): Promise<void> {
     this.logger.info("Shutting down gateway...");
 
+    // Close HTTP intake and drain in-flight requests FIRST, so no request runs
+    // against a closed store or an ended Postgres/Mongo pool within the drain
+    // limit (TDAI_SHUTDOWN_DRAIN_MS, default 5000). After the limit the open
+    // connections are closed, but a handler still running keeps running and its
+    // later store calls fail or return a fallback. The whole stop sequence must
+    // fit the platform's grace period (docker stop: 10 s).
+    if (this.server) {
+      const forced = await drainHttpServer(this.server, shutdownDrainMs(), this.logger);
+      this.logger.info(
+        forced === 0
+          ? "HTTP server closed (in-flight requests drained)"
+          : `HTTP server closed (${forced} connection(s) closed at the drain limit)`,
+      );
+    }
+
     // 优雅关闭 OTel SDK（flush 剩余 Span/Log）
     try {
       await shutdownOTelSDK();
@@ -898,20 +916,17 @@ export class TdaiGateway {
       this.metadataStorePool = null;
       this.logger.info("Metadata Store Pool closed");
     }
-
     if (this.analyticsChClientInstance) {
       await this.analyticsChClientInstance.close().catch(() => {});
       this.analyticsChClientInstance = null;
       this.logger.info?.("Analytics CH client closed");
     }
 
-    if (this.server) {
-      await new Promise<void>((resolve) => {
-        this.server!.close(() => resolve());
-      });
-    }
-
+    // core.destroy() drains deferred writes, which may still use a Postgres pool.
     await this.core.destroy();
+    // Postgres pools are shared process-wide (one per owner and URL): end them
+    // once, last — after both store pools are closed and the core has drained.
+    await getSharedPgPoolRegistry().endAll();
     this.logger.info("Gateway stopped");
   }
 
@@ -1105,8 +1120,7 @@ export class TdaiGateway {
         const logger = this.logger;
 
         v2Deps.resolveStore = async (instanceId: string) => {
-          const { vdbConfig, mongoConfig } = await this.resolveStoreBackendConfigs(instanceId);
-          const pooled = await storePool.getStore(instanceId, vdbConfig, mongoConfig);
+          const pooled = await storePool.getStore(instanceId, await this.resolveDbChoice(instanceId));
           return { store: pooled.store, embedding: pooled.embedding };
         };
 
@@ -1135,7 +1149,7 @@ export class TdaiGateway {
         // 复用 Memory 侧的 COS adapter，创建 per-instance SkillCore。
         // Skill queue + worker 如果已在 tdai-core 中启动则复用；否则
         // service 模式下可在此处单独启动。
-        if (storePool.mode === "tcvdb" || storePool.mode === "mongodb") {
+        if (DB_TRAITS[storePool.mode].pooledSkillStore) {
           // per-instance resolvers 抽到了私有方法（同一份实现被 handler 和 skill worker 共用）。
           // tcvdb: TcvdbSkillStore + COS storage；mongodb: MongoSkillStore + (standalone) LocalStorage / (service) COS。
           skillDeps.resolveSkillCore = (instanceId: string) => this.resolveSkillCoreForInstance(instanceId);
@@ -1151,7 +1165,7 @@ export class TdaiGateway {
         //   - handleConversationAdd 用 .handler
         //   - handleExtract 用 .trigger (direct-trigger)
         skillDeps.resolveConversationAdd = async (instanceId: string) => {
-          const wired = storePool.mode === "tcvdb" || storePool.mode === "mongodb"
+          const wired = DB_TRAITS[storePool.mode].pooledSkillStore
             ? await this.ensureConversationAddForInstance(instanceId)
             : await this.ensureConversationAddForStandalone(instanceId);
           return wired;
@@ -1949,11 +1963,11 @@ export class TdaiGateway {
     // service-mode integration smoke tests where Redis + COS are real but no
     // VDB is available — set STORE_MODE=sqlite to keep the VDB-dependent
     // pieces local while exercising the rest of the service-mode wiring.
-    const storeModeOverride =
-      process.env.STORE_MODE === "sqlite" || process.env.STORE_MODE === "tcvdb" || process.env.STORE_MODE === "mongodb"
-        ? (process.env.STORE_MODE as "sqlite" | "tcvdb" | "mongodb")
-        : undefined;
-    const effectiveStoreMode = storeModeOverride ?? (this.config.deployMode === "service" ? "tcvdb" : "sqlite");
+    // An unknown value stops startup (parseStoreMode throws); unset or empty keeps the deploy-mode default.
+    const effectiveStoreMode = parseStoreMode(
+      process.env.STORE_MODE,
+      this.config.deployMode === "service" ? "tcvdb" : "sqlite",
+    );
     // T12 fail-fast: mongodb backend hard-requires MONGODB_ENDPOINT/DATABASE
     // (delivered via LocalConfigSource.fetchMongo). Missing them is a config
     // error we surface at boot instead of on the first request.
@@ -1970,6 +1984,15 @@ export class TdaiGateway {
       }
       this.logger.info(`[gateway] Store backend = mongodb (endpoint=${mongoEnv.endpoint}, database=${mongoEnv.database})`);
     }
+    // STORE_MODE=postgres needs POSTGRES_URL with a postgres:// scheme,
+    // a valid POSTGRES_SCHEMA_PREFIX and POSTGRES_POOL_MAX; the error names the variable.
+    if (effectiveStoreMode === "postgres") {
+      const pgSettings = parsePostgresSettings(readPostgresEnvConfig());
+      this.logger.info(
+        `[gateway] Store backend = postgres (url=${redactUrl(pgSettings.url)}, ` +
+          `schemaPrefix=${pgSettings.schemaPrefix}, poolMax=${pgSettings.poolMax})`,
+      );
+    }
     this.storePool = new StorePool({
       mode: effectiveStoreMode,
       memoryCfg: this.config.memory,
@@ -1985,13 +2008,13 @@ export class TdaiGateway {
     this.logger.info(`Instance Config Provider + Store Pool initialized (mode=${this.config.deployMode})`);
 
     // P9 选择层接入：装配层（resolveStoreBackendConfigs / resolveStorageForInstance）
-    // 改走 resolver。storeMode 传显式覆盖值（未设置时 resolver 按形态兜底，规则与
-    // effectiveStoreMode 相同）；fileStore 已是 T3.0 解析后的确定值。
+    // 改走 resolver。storeMode 传 parseStoreMode 解析后的确定值（STORE_MODE 未设置时
+    // 即按形态兜底的默认值）；fileStore 已是 T3.0 解析后的确定值。
     // TDAI_BACKEND_RESOLVER=off → 不构建 resolver，装配层回退旧全局开关分支。
     if (this.config.features.backendResolver) {
       this.backendResolver = new LocalBackendResolver({
         deployMode: this.config.deployMode,
-        storeMode: storeModeOverride,
+        storeMode: effectiveStoreMode,
         fileStore: this.config.data.fileStore,
         fileStoreOthers: this.config.data.fileStoreOthers,
         source: this.configProvider,
@@ -2071,35 +2094,39 @@ export class TdaiGateway {
    * 和 handler（每请求）走两份不同的构造逻辑。
    */
   /**
-   * Resolve the per-instance backend configs to feed StorePool.getStore/getSkillStore.
+   * Resolve the per-instance DB choice (explicit kind + conn) that feeds
+   * StorePool.getStore/getSkillStore.
    *
-   * D11: which backend a given instance uses is driven by the process store mode
-   * (standalone: sqlite|mongodb; service: tcvdb). Only the config for the active
-   * mode is resolved — `mongoConfig` for `mongodb`, `vdbConfig` for `tcvdb`, and
-   * both null for sqlite (local file store).
+   * Which backend an instance uses is driven by the process store mode
+   * (standalone: sqlite|mongodb|postgres; service: tcvdb by default). Only the
+   * conn for the active kind is resolved; sqlite carries `conn: null`.
    */
-  private async resolveStoreBackendConfigs(
-    instanceId: string,
-  ): Promise<{ vdbConfig: VdbConfig | null; mongoConfig: MongoConfig | null }> {
+  private async resolveDbChoice(instanceId: string): Promise<DbChoice> {
     // P9 选择层路径：解析结果带显式 kind，且已经过 validateResolution
     // （sqlite × rowfs 等非法组合在解析期 fail-fast，而不是首次读写时）。
     if (this.backendResolver) {
-      const resolution = await this.backendResolver.resolve(instanceId);
-      return dbChoiceToStoreConfigs(resolution.db);
+      return (await this.backendResolver.resolve(instanceId)).db;
     }
     // 旧分支（TDAI_BACKEND_RESOLVER=off 回滚路径）：进程级全局 mode 门控。
     const provider = this.configProvider;
     const mode = this.storePool?.mode;
     if (!provider || !mode) {
-      return { vdbConfig: null, mongoConfig: null };
+      return { kind: "sqlite", conn: null };
     }
-    if (mode === "mongodb") {
-      return { vdbConfig: null, mongoConfig: await provider.resolveMongo(instanceId) };
+    switch (mode) {
+      case "sqlite":
+        return { kind: mode, conn: null };
+      case "tcvdb":
+        return { kind: mode, conn: await provider.resolveVdb(instanceId) };
+      case "mongodb":
+        return { kind: mode, conn: await provider.resolveMongo(instanceId) };
+      case "postgres":
+        return { kind: mode, conn: await provider.resolvePostgres(instanceId) };
+      default: {
+        const unknownMode: never = mode;
+        throw new Error(`${TAG} unknown store mode: ${String(unknownMode)}`);
+      }
     }
-    if (mode === "tcvdb") {
-      return { vdbConfig: await provider.resolveVdb(instanceId), mongoConfig: null };
-    }
-    return { vdbConfig: null, mongoConfig: null };
   }
 
   private async resolveSkillCoreForInstance(instanceId: string): Promise<SkillCoreType> {
@@ -2109,8 +2136,7 @@ export class TdaiGateway {
     const storePool = this.storePool;
     const logger = this.logger;
 
-    const { vdbConfig, mongoConfig } = await this.resolveStoreBackendConfigs(instanceId);
-    const skillStore = await storePool.getSkillStore(instanceId, vdbConfig, mongoConfig);
+    const skillStore = await storePool.getSkillStore(instanceId, await this.resolveDbChoice(instanceId));
 
     // Skill resource storage: reuse the shared per-instance resolver so the
     // fallback semantics match the memory path — standalone → LocalStorageBackend
@@ -2442,8 +2468,7 @@ export class TdaiGateway {
     //   - tcvdb / mongodb → per-instance SkillCore from StorePool (TcvdbSkillStore /
     //     MongoSkillStore). This holds even for standalone + STORE_MODE=mongodb.
     //   - otherwise (sqlite singleton) → TdaiCore's standalone SkillExtractor.
-    const usePerInstanceSkill =
-      this.storePool?.mode === "tcvdb" || this.storePool?.mode === "mongodb";
+    const usePerInstanceSkill = this.storePool ? DB_TRAITS[this.storePool.mode].pooledSkillStore : false;
 
     this.skillWorkerPool = new SkillWorkerPool({
       concurrency: skillCfg.worker.concurrency,
@@ -2612,8 +2637,7 @@ export class TdaiGateway {
     let store: IMemoryStore | undefined;
 
     if (this.storePool && this.configProvider) {
-      const { vdbConfig, mongoConfig } = await this.resolveStoreBackendConfigs(instanceId);
-      const pooled = await this.storePool.getStore(instanceId, vdbConfig, mongoConfig);
+      const pooled = await this.storePool.getStore(instanceId, await this.resolveDbChoice(instanceId));
       store = pooled.store;
     } else {
       store = this.core.getVectorStore();
@@ -2661,8 +2685,8 @@ export class TdaiGateway {
       // mongofs 腿需要实例 Mongo 配置（本地解析器不会产生 files×mongofs，
       // 这里是给未来按实例下发形态留的正面路径）。
       if (othersKind === "mongofs") {
-        const { mongoConfig } = await this.resolveStoreBackendConfigs(instanceId);
-        return this.resolveMongoFsOthersForInstance(instanceId, mongoConfig);
+        const db = await this.resolveDbChoice(instanceId);
+        return this.resolveMongoFsOthersForInstance(instanceId, db.kind === "mongodb" ? db.conn : null);
       }
       return this.resolveFileOthersForInstance(instanceId);
     }
@@ -2690,8 +2714,8 @@ export class TdaiGateway {
     if (!this.storePool) {
       throw new Error(`FILE_STORE_MODE=rowfs requires a store pool (instance=${instanceId})`);
     }
-    const { vdbConfig, mongoConfig } = await this.resolveStoreBackendConfigs(instanceId);
-    const { store } = await this.storePool.getStore(instanceId, vdbConfig, mongoConfig);
+    const db = await this.resolveDbChoice(instanceId);
+    const { store } = await this.storePool.getStore(instanceId, db);
     const rowStore = requireProfileRowStore(store, { dbKind: this.storePool.mode, fsKind: "rowfs" });
 
     // mongofs others 腿（TCS 零磁盘形态）：非 profile 键全部落在实例自己的
@@ -2699,7 +2723,7 @@ export class TdaiGateway {
     // validateResolution 拦截；旧分支路径在此防御性再查一次。
     const others =
       othersKind === "mongofs"
-        ? await this.resolveMongoFsOthersForInstance(instanceId, mongoConfig)
+        ? await this.resolveMongoFsOthersForInstance(instanceId, db.kind === "mongodb" ? db.conn : null)
         : await this.resolveFileOthersForInstance(instanceId);
     const profileBackend = new ProfileRowStorageBackend({
       store: rowStore,
@@ -2921,8 +2945,7 @@ export class TdaiGateway {
       if (!instanceId) {
         throw new Error(`Task ${task.id} missing instanceId in service mode (task.data.instanceId is required)`);
       }
-      const { vdbConfig, mongoConfig } = await gateway.resolveStoreBackendConfigs(instanceId);
-      return storePool.getStore(instanceId, vdbConfig, mongoConfig);
+      return storePool.getStore(instanceId, await gateway.resolveDbChoice(instanceId));
     };
 
     const resolveStorage = async (task: TaskPayload) => {

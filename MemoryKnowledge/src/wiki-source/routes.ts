@@ -87,15 +87,16 @@ export function createWikiSourceRoutes(deps: WikiSourceRouteDeps): Hono {
 
     // 凭据按 wiki_id 取；不存在 → 401 NEED_CREDENTIAL（前端弹填写页）
     const ref = { type: "wiki" as const, serviceId: a.serviceId, resourceId: wikiId };
-    const cred = deps.credentialStore.get(ref);
-    if (!cred) {
+    // 一次读一行：凭据 + provider_id。
+    const found = await deps.credentialStore.getWithProvider(ref);
+    if (!found) {
       return c.json(wrapError(401, "NEED_CREDENTIAL: no credential for this wiki"));
     }
-    const status = deps.credentialStore.status(ref);
+    const cred = found.credential;
 
     try {
       const { provider, ctx } = deps.registry.contextFor(
-        status?.provider_id ?? providerId,
+        found.provider_id,
         cred.secret,
         cred.username,
       );
@@ -144,17 +145,18 @@ export function createWikiSourceRoutes(deps: WikiSourceRouteDeps): Hono {
     if (!providerId) return c.json(wrapError(400, "provider_id is required"));
 
     const ref = { type: "wiki" as const, serviceId: a.serviceId, resourceId: wikiId };
-    const cred = deps.credentialStore.get(ref);
-    if (!cred) {
+    // 一次读一行：凭据 + provider_id。
+    const found = await deps.credentialStore.getWithProvider(ref);
+    if (!found) {
       return c.json(wrapError(401, "NEED_CREDENTIAL: no credential for this wiki"));
     }
-    const status = deps.credentialStore.status(ref);
+    const cred = found.credential;
 
     try {
       const result = await runImport({
         registry: deps.registry,
         wikiService: deps.wikiService,
-        providerId: status?.provider_id ?? providerId,
+        providerId: found.provider_id,
         secret: cred.secret,
         username: cred.username,
         serviceId: a.serviceId,

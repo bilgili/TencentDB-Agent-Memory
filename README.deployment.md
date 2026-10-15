@@ -486,6 +486,105 @@ memory:
 
 ---
 
+## PostgreSQL backend
+
+SQLite is the default store. PostgreSQL is an optional store that you select with settings. Existing deployments do not change.
+
+### Requirements
+
+- PostgreSQL 15 or later.
+- A database with UTF-8 (Unicode Transformation Format 8-bit) encoding and a UTF-8 locale, for example `C.UTF-8` or `en_US.UTF-8`. Keyword search of Chinese, Japanese and Korean (CJK) text needs it. The store checks this at start. If the check fails, keyword search runs in degraded mode and the log shows the cause.
+- The pgvector extension, version 0.8.0 or later. The image `pgvector/pgvector:0.8.0-pg17`, or a newer image, includes it.
+
+### One-time extension setup
+
+pgvector 0.8.0 is not a trusted extension. A role without superuser rights cannot run `CREATE EXTENSION vector`. A superuser runs this command one time for each database:
+
+```sql
+CREATE EXTENSION vector;
+```
+
+If pgvector is missing or older than 0.8.0, the stores run without vector search. The log shows the cause. Keyword search still works.
+
+### Settings
+
+| Scope | Setting | Default | Meaning |
+|---|---|---|---|
+| Gateway: memory and skill store | `STORE_MODE=postgres` | `sqlite` | Selects the Postgres store. |
+| Gateway: memory and skill store | `POSTGRES_URL` | none | Connection URL (Uniform Resource Locator). Required when `STORE_MODE=postgres`. |
+| Gateway: memory and skill store | `POSTGRES_SCHEMA_PREFIX` | `tdai` | Prefix of the schema names. |
+| Gateway: memory and skill store | `POSTGRES_POOL_MAX` | `10` | Maximum connections in the pool. |
+| Gateway | `TDAI_SHUTDOWN_DRAIN_MS` | `5000` | Maximum time in milliseconds that the gateway waits for running requests when it stops. Then it closes the open connections. The full stop must fit the grace period of the platform (`docker stop` waits 10 seconds). |
+| Plugin and `TdaiCore` path | `memory.storeBackend: "postgres"` and `memory.postgres.{url,schemaPrefix,poolMax}` | same as above | Same meaning as the gateway settings, for the path without a gateway. |
+| Metadata store | `TDAI_METADATA_POSTGRES_URL` | none | Selects Postgres for the metadata store. Do not set it together with `TDAI_METADATA_MONGO_URI`. |
+| Metadata store | `TDAI_METADATA_POSTGRES_SCHEMA_PREFIX` | `tdai` | Prefix of the metadata schema names. |
+| Metadata store | `TDAI_METADATA_POSTGRES_POOL_MAX` | `5` | Maximum connections in the metadata pool. |
+| MemoryKnowledge | `KNOWLEDGE_DB_URL` | none | A `postgres://` or `postgresql://` URL selects Postgres. If it is not set, `KNOWLEDGE_DB_PATH` (SQLite) applies. |
+| MemoryKnowledge | `KNOWLEDGE_DB_SCHEMA` | `knowledge` | Schema name. The service rejects `public` and names that start with `pg_`. |
+| MemoryKnowledge | `KNOWLEDGE_DB_POOL_MAX` | `10` | Maximum connections in the pool. |
+
+The gateway stops at start in these cases:
+
+- `STORE_MODE` has a value that is not `sqlite`, `tcvdb`, `mongodb` or `postgres`. An empty value selects the default.
+- `STORE_MODE=postgres` without `POSTGRES_URL`.
+- Both `TDAI_METADATA_POSTGRES_URL` and `TDAI_METADATA_MONGO_URI` are set.
+- A URL has a wrong scheme, or a schema prefix is not valid.
+
+In `service` deploy mode, either metadata URL satisfies the metadata requirement. The log hides the password of every Postgres URL.
+
+### Schemas
+
+Each instance has its own schemas. The services create them at first start.
+
+- `<prefix>_mem_<instanceId>`: memory and skill store.
+- `<prefix>_meta_<instanceId>`: metadata store.
+- The schema in `KNOWLEDGE_DB_SCHEMA`: MemoryKnowledge.
+
+A schema prefix matches `^[a-z][a-z0-9]{0,15}$` and is not `pg`. A prefix has no `_`, so the first `_` of a schema name ends the prefix and two instances never get the same schema name. A service with an invalid prefix stops at startup and names the setting.
+
+`KNOWLEDGE_DB_SCHEMA` has its own rule. When MemoryKnowledge uses the same database as MemoryCore, do not set `KNOWLEDGE_DB_SCHEMA` to a name that starts with `<prefix>_mem_` or `<prefix>_meta_`.
+
+### Connection limit
+
+The pool settings limit the connections that the services open. Keep this sum within the server limit:
+
+```text
+gateways × POSTGRES_POOL_MAX
+  + gateways × TDAI_METADATA_POSTGRES_POOL_MAX
+  + KNOWLEDGE_DB_POOL_MAX
+  + 1
+  ≤ max_connections − reserved connections
+```
+
+The `+ 1` is the connection that MemoryKnowledge keeps for its lock. Example: 2 gateways with the default pool sizes need 2 × 10 + 2 × 5 + 10 + 1 = 41 connections. The PostgreSQL default of `max_connections = 100` is enough for this case.
+
+### One MemoryKnowledge process for each schema
+
+Run one MemoryKnowledge process for each Postgres schema. The process takes an advisory lock when it starts. A second process finds the lock and stops with an error. Do not start two replicas on one schema.
+
+PgBouncer in session mode is supported. PgBouncer in transaction mode is not supported for MemoryKnowledge, because it does not keep the session lock.
+
+### Enable Postgres on the gateway
+
+Add these options to the gateway start command, for example to the `docker run` command in the Docker section:
+
+```bash
+  -e STORE_MODE=postgres \
+  -e POSTGRES_URL="postgres://<USER>:<PASSWORD>@<HOST>:5432/tdai_memory" \
+  -e TDAI_METADATA_POSTGRES_URL="postgres://<USER>:<PASSWORD>@<HOST>:5432/tdai_memory" \
+```
+
+For a local stack, use `deploy/global-images/start-all-postgres.sh`. For MemoryKnowledge alone, use the `postgres` profile in `MemoryKnowledge/docker-compose.yml`.
+
+### Switch backends and roll back
+
+- Switching backends does not migrate data. A new Postgres store starts empty.
+- The SQLite files stay untouched on the volumes.
+- To roll back, remove the Postgres settings and restart. The services use the SQLite files and their earlier data again.
+- Instance destroy deletes no memory data on any backend. The `/v3` instance destroy call drops the metadata schema of the instance. A later request for the same instance can create an empty metadata schema again.
+
+---
+
 ## 典型部署示例
 
 ### 示例 1：本地开发（最简）

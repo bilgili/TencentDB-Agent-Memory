@@ -31,7 +31,13 @@ import type { MongoClientPool } from "./mongodb/client-pool.js";
 import { createBM25Encoder } from "./bm25-local.js";
 import type { BM25LocalEncoder } from "./bm25-local.js";
 import type { VdbConfig, MongoConfig } from "../instance-config-provider.js";
+import type { DbChoice, DbKind } from "../backend-selection/types.js";
 import type { ISkillStore } from "../skill/skill-store.interface.js";
+import { redactUrl } from "./postgres/settings.js";
+import { getSharedPgPoolRegistry } from "./postgres/pool-registry.js";
+import { PostgresMemoryStore } from "./postgres/memory-store.js";
+import { PostgresSkillStore } from "./postgres/skill-store.js";
+import type { PostgresConfig } from "../instance-config-provider.js";
 import { metricProducer } from "../report/kafka-metric-producer.js";
 
 const TAG = "[store-pool]";
@@ -60,7 +66,12 @@ interface Logger {
   error: (message: string) => void;
 }
 
-export type StoreMode = "sqlite" | "tcvdb" | "mongodb";
+/** Process default store kind — an alias of the one kind list, `DbKind`. */
+export type StoreMode = DbKind;
+
+function unknownDbKind(db: never): never {
+  throw new Error(`${TAG} unknown db kind: ${(db as { kind?: unknown }).kind}`);
+}
 
 export interface KafkaMetricOptions {
   /** Kafka Broker 列表 (逗号分隔或数组) */
@@ -169,28 +180,15 @@ export class StorePool {
   }
 
   /**
-   * 获取指定 instanceId 对应的 Store 实例
+   * 获取指定 instanceId 对应的 Store 实例。
    *
-   * - standalone (sqlite): vdbConfig 可以为 null, 创建 SQLite Store
-   * - service (tcvdb): 根据 vdbConfig 创建 TCVDB Store
+   * `db` is the selection layer's explicit kind + conn:
+   * the pool switches on `db.kind` and never infers the kind from which config
+   * happens to be present.
    */
-  async getStore(
-    instanceId: string,
-    vdbConfig: VdbConfig | null,
-    mongoConfig?: MongoConfig | null,
-  ): Promise<PooledStore> {
+  async getStore(instanceId: string, db: DbChoice): Promise<PooledStore> {
     const now = Date.now();
-    // D11: backend selected per-instance from the config actually delivered —
-    // mongoConfig present → mongodb; else tcvdb when in tcvdb mode with a vdb;
-    // else sqlite. `mode` is the process default that drives which config the
-    // caller resolves, but the presence check is authoritative here.
-    const backend: StoreMode = mongoConfig
-      ? "mongodb"
-      : (this.mode === "tcvdb" && vdbConfig ? "tcvdb" : "sqlite");
-    const fingerprint =
-      backend === "mongodb" && mongoConfig ? this.computeMongoFingerprint(mongoConfig)
-      : backend === "tcvdb" && vdbConfig ? this.computeFingerprint(vdbConfig)
-      : `sqlite:${instanceId}`;
+    const { fingerprint, label } = this.describeDb(instanceId, db);
     const cached = this.pool.get(instanceId);
 
     // 命中且配置未变
@@ -211,10 +209,7 @@ export class StorePool {
     }
 
     // 创建新 Store
-    const pooledStore =
-      backend === "mongodb" && mongoConfig ? this.createMongoStore(mongoConfig)
-      : backend === "tcvdb" && vdbConfig ? this.createTcvdbStore(vdbConfig)
-      : this.createSqliteStore(instanceId);
+    const pooledStore = this.createStore(instanceId, db);
 
     this.pool.set(instanceId, {
       pooledStore,
@@ -222,12 +217,8 @@ export class StorePool {
       lastAccessedAt: now,
     });
 
-    const storeDesc =
-      backend === "mongodb" && mongoConfig ? `mongodb ${mongoConfig.endpoint} / ${mongoConfig.database}`
-      : backend === "tcvdb" && vdbConfig ? `${vdbConfig.url} / ${vdbConfig.database}`
-      : `sqlite @ ${this.getSqlitePath(instanceId)}`;
     this.logger.info(
-      `${TAG} Created ${backend} store for ${instanceId}: ${storeDesc} (pool size: ${this.pool.size})`,
+      `${TAG} Created ${db.kind} store for ${instanceId}: ${label} (pool size: ${this.pool.size})`,
     );
 
     // 初始化 Store (建表/检查连接)
@@ -238,6 +229,43 @@ export class StorePool {
     }
 
     return pooledStore;
+  }
+
+  private createStore(instanceId: string, db: DbChoice): PooledStore {
+    switch (db.kind) {
+      case "sqlite":
+        return this.createSqliteStore(instanceId);
+      case "tcvdb":
+        return this.createTcvdbStore(db.conn);
+      case "mongodb":
+        return this.createMongoStore(db.conn);
+      case "postgres":
+        return this.createPostgresStore(db.conn);
+      default:
+        return unknownDbKind(db);
+    }
+  }
+
+  /** Cache fingerprint (detects a config change) and a log label (no secrets) for `db`. */
+  private describeDb(instanceId: string, db: DbChoice): { fingerprint: string; label: string } {
+    switch (db.kind) {
+      case "sqlite":
+        return { fingerprint: `sqlite:${instanceId}`, label: `sqlite @ ${this.getSqlitePath(instanceId)}` };
+      case "tcvdb":
+        return { fingerprint: this.computeFingerprint(db.conn), label: `${db.conn.url} / ${db.conn.database}` };
+      case "mongodb":
+        return {
+          fingerprint: this.computeMongoFingerprint(db.conn),
+          label: `mongodb ${db.conn.endpoint} / ${db.conn.database}`,
+        };
+      case "postgres":
+        return {
+          fingerprint: `postgres:${db.conn.url}|${db.conn.schema}`,
+          label: `postgres ${redactUrl(db.conn.url)} / ${db.conn.schema}`,
+        };
+      default:
+        return unknownDbKind(db);
+    }
   }
 
   /**
@@ -328,16 +356,13 @@ export class StorePool {
   has(instanceId: string): boolean { return this.pool.has(instanceId); }
 
   /**
-   * 获取指定 instanceId 的 Skill Store (TCVDB).
+   * 获取指定 instanceId 的 per-instance Skill Store (kinds with
+   * `DB_TRAITS[kind].pooledSkillStore`).
    *
-   * 与 getStore() 使用相同的 VDB 实例，只是不同的 Collection ({db}_skills)。
+   * 与 getStore() 使用相同的后端实例/连接，只是不同的 Collection/表。
    * Skill store 有独立缓存 (skillStoreCache)，不受 Memory store 池化管理影响。
    */
-  async getSkillStore(
-    instanceId: string,
-    vdbConfig?: VdbConfig | null,
-    mongoConfig?: MongoConfig | null,
-  ): Promise<ISkillStore> {
+  async getSkillStore(instanceId: string, db: DbChoice): Promise<ISkillStore> {
     const key = `skill:${instanceId}`;
     const cached = this.skillStoreCache.get(key);
     if (cached) {
@@ -345,42 +370,58 @@ export class StorePool {
       return cached;
     }
 
+    let store: ISkillStore;
+    let label: string;
+    switch (db.kind) {
+      case "mongodb":
+        store = new MongoSkillStore({
+          pool: this.getMongoPool(),
+          mongoConfig: db.conn,
+          logger: this.logger as StoreLogger,
+        });
+        label = `mongodb ${db.conn.endpoint}/${db.conn.database}`;
+        break;
+      case "tcvdb":
+        store = new TcvdbSkillStore({
+          url: db.conn.url,
+          username: db.conn.user,
+          apiKey: db.conn.apiKey,
+          database: db.conn.database,
+          embeddingModel: this.memoryCfg.tcvdb?.embeddingModel ?? "bge-large-zh",
+          timeout: this.memoryCfg.tcvdb?.timeout ?? 10000,
+          logger: this.logger as StoreLogger,
+          bm25Encoder: this.sharedBm25Encoder,
+        });
+        label = `tcvdb ${db.conn.url}/${db.conn.database}`;
+        break;
+      case "postgres":
+        // Same shared pool and mem schema as the memory store.
+        store = new PostgresSkillStore({
+          pool: getSharedPgPoolRegistry(this.logger as StoreLogger).get("store", db.conn.url, db.conn.poolMax),
+          schema: db.conn.schema,
+          dimensions: this.memoryCfg.embedding.dimensions ?? 0,
+          logger: this.logger as StoreLogger,
+        });
+        label = `postgres ${redactUrl(db.conn.url)}/${db.conn.schema}`;
+        break;
+      case "sqlite":
+        throw new Error(
+          `${TAG} getSkillStore(${instanceId}): sqlite has no pooled skill store ` +
+            `(DB_TRAITS.sqlite.pooledSkillStore=false; TdaiCore owns the SQLite skill store)`,
+        );
+      default:
+        return unknownDbKind(db);
+    }
+
     // LRU 淘汰
     if (this.skillStoreCache.size >= this.maxSkillStores) {
       this.evictSkillStoreLru();
     }
 
-    if (mongoConfig) {
-      const mongoStore = new MongoSkillStore({
-        pool: this.getMongoPool(),
-        mongoConfig,
-        logger: this.logger as StoreLogger,
-      });
-      mongoStore.init();
-      this.skillStoreCache.set(key, mongoStore);
-      this.skillStoreAccessTimes.set(key, Date.now());
-      this.logger.info(`${TAG} Created mongo skill store for ${instanceId}: ${mongoConfig.endpoint}/${mongoConfig.database} (cached: ${this.skillStoreCache.size})`);
-      return mongoStore;
-    }
-
-    if (!vdbConfig) {
-      throw new Error(`${TAG} getSkillStore(${instanceId}) requires a vdbConfig (tcvdb) or mongoConfig (mongodb)`);
-    }
-
-    const store = new TcvdbSkillStore({
-      url: vdbConfig.url,
-      username: vdbConfig.user,
-      apiKey: vdbConfig.apiKey,
-      database: vdbConfig.database,
-      embeddingModel: this.memoryCfg.tcvdb?.embeddingModel ?? "bge-large-zh",
-      timeout: this.memoryCfg.tcvdb?.timeout ?? 10000,
-      logger: this.logger as StoreLogger,
-      bm25Encoder: this.sharedBm25Encoder,
-    });
     store.init();
     this.skillStoreCache.set(key, store);
     this.skillStoreAccessTimes.set(key, Date.now());
-    this.logger.info(`${TAG} Created skill store for ${instanceId}: ${vdbConfig.url}/${vdbConfig.database} (cached: ${this.skillStoreCache.size})`);
+    this.logger.info(`${TAG} Created skill store for ${instanceId}: ${label} (cached: ${this.skillStoreCache.size})`);
     return store;
   }
 
@@ -452,12 +493,12 @@ export class StorePool {
   // Internal — SQLite Store
   // ════════════════════════════════════════════════════════
 
-  private createSqliteStore(instanceId: string): PooledStore {
+  /** App-side embedding service for stores that keep their own vectors (sqlite, postgres). */
+  private createAppEmbedding(): EmbeddingService {
     // Embedding service (远端 API, 如 OpenAI text-embedding)
-    let embeddingService: EmbeddingService | undefined;
     const embCfg = this.memoryCfg.embedding;
     if (embCfg.enabled && embCfg.provider !== "local" && embCfg.provider !== "none" && embCfg.apiKey) {
-      embeddingService = createEmbeddingService({
+      return createEmbeddingService({
         provider: embCfg.provider,
         baseUrl: embCfg.baseUrl,
         apiKey: embCfg.apiKey,
@@ -466,7 +507,26 @@ export class StorePool {
         maxInputChars: embCfg.maxInputChars,
       }, this.logger as StoreLogger);
     }
+    return new NoopEmbeddingService() as unknown as EmbeddingService;
+  }
 
+  // ════════════════════════════════════════════════════════
+  // Internal — Postgres Store
+  // ════════════════════════════════════════════════════════
+
+  /** One shared "store" pg.Pool per URL; the store owns its schema, never the pool. */
+  private createPostgresStore(conn: PostgresConfig): PooledStore {
+    const store = new PostgresMemoryStore({
+      pool: getSharedPgPoolRegistry(this.logger as StoreLogger).get("store", conn.url, conn.poolMax),
+      schema: conn.schema,
+      dimensions: this.memoryCfg.embedding.dimensions ?? 0,
+      logger: this.logger as StoreLogger,
+    });
+    return { store, embedding: this.createAppEmbedding(), bm25Encoder: this.sharedBm25Encoder };
+  }
+
+  private createSqliteStore(instanceId: string): PooledStore {
+    const embCfg = this.memoryCfg.embedding;
     const dims = embCfg.dimensions ?? 0;
     const dbPath = this.getSqlitePath(instanceId);
     // 确保数据库目录存在（对于非 default instance）
@@ -476,11 +536,7 @@ export class StorePool {
     }
     const store = new VectorStore(dbPath, dims, this.logger as StoreLogger);
 
-    return {
-      store,
-      embedding: (embeddingService ?? new NoopEmbeddingService()) as unknown as EmbeddingService,
-      bm25Encoder: this.sharedBm25Encoder,
-    };
+    return { store, embedding: this.createAppEmbedding(), bm25Encoder: this.sharedBm25Encoder };
   }
 
   /**

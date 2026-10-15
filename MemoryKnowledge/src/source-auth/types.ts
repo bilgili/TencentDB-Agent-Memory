@@ -48,22 +48,34 @@ export interface CredentialStatus {
   updated_at: string;
 }
 
-/** 资源级凭据存储。 */
+/** 明文凭据 + 其 provider_id（同一行一次读出）。 */
+export interface CredentialWithProvider {
+  credential: SourceCredential;
+  provider_id: string;
+}
+
+/** 资源级凭据存储。每个数据方法返回 Promise。 */
 export interface ICredentialStore {
   /** 取明文凭据（仅 KS 进程内使用）。未配置 / 解码失败 → null（不抛异常）。 */
-  get(ref: ResourceRef): SourceCredential | null;
+  get(ref: ResourceRef): Promise<SourceCredential | null>;
+  /**
+   * 一次读一行：明文凭据 + provider_id。替代 get + status 两次读
+   * （两次读之间凭据可能被改）。未配置 / 解码失败 → null。
+   */
+  getWithProvider(ref: ResourceRef): Promise<CredentialWithProvider | null>;
   /** provider_id 记录协议来源（'gongfeng' / 'iwiki' 等），非键，仅供展示。 */
-  put(ref: ResourceRef, cred: SourceCredential, providerId: string, updatedBy?: string): void;
-  delete(ref: ResourceRef): boolean;
+  put(ref: ResourceRef, cred: SourceCredential, providerId: string, updatedBy?: string): Promise<void>;
+  /** 幂等：行不存在返回 false。 */
+  delete(ref: ResourceRef): Promise<boolean>;
   /** 仅元数据，不回吐 secret。 */
-  status(ref: ResourceRef): CredentialStatus | null;
+  status(ref: ResourceRef): Promise<CredentialStatus | null>;
   /**
    * 列出**全服务**下某类资源的全部凭据行（仅 id + service，供后台调度器扫描）。
    * KS 内部方法，不对外暴露 HTTP 端点（跨资源枚举增加越权面）。
    */
-  listAllByType(type: ResourceType): Array<{ serviceId: string; resourceId: string }>;
+  listAllByType(type: ResourceType): Promise<Array<{ serviceId: string; resourceId: string }>>;
   /** 记录一次校验结果（仅更新时间戳）。 */
-  recordVerify(ref: ResourceRef): void;
+  recordVerify(ref: ResourceRef): Promise<void>;
 }
 
 /** 密文行（落库形态）。 */

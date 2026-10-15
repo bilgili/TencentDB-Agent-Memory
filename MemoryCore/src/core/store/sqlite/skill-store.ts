@@ -305,9 +305,17 @@ export class SqliteSkillStore implements ISkillStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       if (head) {
-        this.db
-          .prepare("UPDATE skills SET is_head=0 WHERE skill_id=? AND version=?")
+        // CAS on the head read before BEGIN: an
+        // archive, delete or append in that window must not get a new active head.
+        const demoted = this.db
+          .prepare("UPDATE skills SET is_head=0 WHERE skill_id=? AND version=? AND is_head=1 AND status='active'")
           .run(head.skill_id, head.version);
+        if (demoted.changes !== 1) {
+          throw new SkillStoreError(
+            "SKILL_VERSION_STALE",
+            `head v${head.version} of ${head.skill_id} was archived, deleted or replaced before append`,
+          );
+        }
       }
 
       this.db

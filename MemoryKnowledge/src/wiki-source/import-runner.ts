@@ -32,7 +32,7 @@ export interface WikiServiceLike {
     teamId: string,
     wikiId: string,
     files: Array<{ filename: string; content: string }>,
-  ): RawWriteOutcome | Promise<RawWriteOutcome>;
+  ): Promise<RawWriteOutcome>;
 
   /**
    * 稳定文件名映射（可选）。由 WikiService 实现：把 externalId → filename

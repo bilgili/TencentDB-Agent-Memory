@@ -36,7 +36,11 @@ export interface ConversationSearchResultItem {
 export interface ConversationSearchResult {
   results: ConversationSearchResultItem[];
   total: number;
-  /** Actual search strategy used: "hybrid", "embedding", "fts", or "none". */
+  /**
+   * Actual search strategy used: "hybrid", "embedding", "fts", or "none".
+   * It names the paths that returned hits inside the requested scope (session
+   * included), so a session search reports only the paths that found that session.
+   */
   strategy: string;
   /** Optional message, e.g. when embedding is not configured. */
   message?: string;
@@ -139,17 +143,25 @@ export async function executeConversationSearch(params: {
   // ── Over-retrieve for later filtering and RRF merging ──
   const candidateK = sessionFilter ? limit * 4 : limit * 3;
 
+  // The session narrows the store query itself, so the nearest messages of a
+  // session that is far from the query are not crowded out by other sessions.
+  // An empty string means "no session filter". The session check after the
+  // search stays as a guard.
+  const storeFilter: IsolationFilter | undefined = sessionFilter
+    ? { ...isolationFilter, sessionKey: sessionFilter }
+    : isolationFilter;
+
   // Native text search consumes the original query and owns scoring.
   const capabilities = vectorStore.getCapabilities();
   const nativeBm25 = capabilities.nativeBm25Search === true;
   if (nativeBm25 || (capabilities.nativeHybridSearch && vectorStore.searchL0Hybrid)) {
     const strategy = nativeBm25 ? "fts" : "hybrid";
     const results = nativeBm25
-      ? await (isolationFilter
-        ? vectorStore.searchL0Fts(query, candidateK, isolationFilter)
+      ? await (storeFilter
+        ? vectorStore.searchL0Fts(query, candidateK, storeFilter)
         : vectorStore.searchL0Fts(query, candidateK))
       : await vectorStore.searchL0Hybrid!(
-        isolationFilter ? { query, topK: candidateK, filter: isolationFilter } : { query, topK: candidateK },
+        storeFilter ? { query, topK: candidateK, filter: storeFilter } : { query, topK: candidateK },
       );
     let items: ConversationSearchResultItem[] = results.map((r) => ({
       id: r.record_id,
@@ -187,8 +199,8 @@ export async function executeConversationSearch(params: {
           return [];
         }
         logger?.debug?.(`${TAG} [hybrid-fts] FTS5 query: "${ftsQuery}"`);
-        const ftsResults = isolationFilter
-          ? await vectorStore.searchL0Fts(ftsQuery, candidateK, isolationFilter)
+        const ftsResults = storeFilter
+          ? await vectorStore.searchL0Fts(ftsQuery, candidateK, storeFilter)
           : await vectorStore.searchL0Fts(ftsQuery, candidateK);
         logger?.debug?.(`${TAG} [hybrid-fts] FTS5 returned ${ftsResults.length} candidates`);
         return ftsResults.map((r) => ({
@@ -216,8 +228,8 @@ export async function executeConversationSearch(params: {
         logger?.debug?.(
           `${TAG} [hybrid-vec] Embedding OK, dims=${queryEmbedding.length}, searching top-${candidateK}...`,
         );
-        const vecResults: L0SearchResult[] = isolationFilter
-          ? await vectorStore.searchL0Vector(queryEmbedding, candidateK, query, isolationFilter)
+        const vecResults: L0SearchResult[] = storeFilter
+          ? await vectorStore.searchL0Vector(queryEmbedding, candidateK, query, storeFilter)
           : await vectorStore.searchL0Vector(queryEmbedding, candidateK, query);
         logger?.debug?.(`${TAG} [hybrid-vec] Vector search returned ${vecResults.length} candidates`);
         return vecResults.map((r) => ({

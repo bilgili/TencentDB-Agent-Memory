@@ -34,6 +34,12 @@ export function validateResolution(resolution: BackendResolution): void {
         `Check the instance's Shark delivery (or MONGODB_* env vars in local mode).`,
     );
   }
+  if (db.kind === "postgres" && !db.conn) {
+    throw new BackendResolutionError(
+      `db.kind="postgres" requires a PostgresConfig conn — the config source returned nothing. ` +
+        `Check POSTGRES_URL (local mode) or the instance's config delivery.`,
+    );
+  }
   if (fs.others.kind === "cos" && !fs.others.conn) {
     throw new BackendResolutionError(
       `fs.others="cos" requires a CosConfig conn — the config source returned null. ` +

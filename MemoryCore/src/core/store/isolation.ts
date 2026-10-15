@@ -152,6 +152,25 @@ export function buildIsolationWhere(
 }
 
 /**
+ * Postgres variant of {@link buildIsolationWhere}: same columns and semantics,
+ * but appends each value to `params` and uses `$n` placeholders numbered after
+ * the values already in `params`. Returns "" when the filter narrows nothing.
+ */
+export function buildIsolationWherePg(
+  filter: IsolationFilter | undefined,
+  params: unknown[],
+  tablePrefix = "",
+): string {
+  const { clause, params: values } = buildIsolationWhere(filter, tablePrefix);
+  let i = 0;
+  // The clause holds only column names and `?`, so every `?` is a placeholder.
+  return clause.replace(/\?/g, () => {
+    params.push(values[i++]);
+    return `$${params.length}`;
+  });
+}
+
+/**
  * Check whether a row honours an IsolationFilter (post-retrieve re-check).
  * Used as a safety net after vector / FTS recall, in case the underlying
  * store cannot push the filter down (e.g. older TCVDB collection).

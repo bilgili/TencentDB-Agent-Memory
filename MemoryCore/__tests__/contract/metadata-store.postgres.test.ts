@@ -14,6 +14,7 @@ import {
 } from "../../src/metadata/store/factory.js";
 import { runMetadataStoreContract } from "../../src/metadata/store/metadata-store.contract.js";
 import { InstanceUpstreamWriteConflictError } from "../../src/metadata/types.js";
+import { MetadataError, MetadataService } from "../../src/metadata/service/metadata-service.js";
 import { getSharedPgPoolRegistry, PgPoolRegistry } from "../../src/core/store/postgres/pool-registry.js";
 import { pgSchemaName } from "../../src/core/store/postgres/schema-name.js";
 import { describePg, dropSchemasWithPrefix, randomSchemaPrefix, TEST_POSTGRES_URL, withTestClient } from "../helpers/postgres.js";
@@ -111,6 +112,19 @@ describePg("PostgresMetadataStore", () => {
       expect(new Set(all).size).toBe(all.length);
       store.close();
     }
+  });
+
+  it("concurrent init-admin from two stores on one schema: one admin, loser gets already_initialized", async () => {
+    const schema = pgSchemaName("meta", `c${n++}`, prefix);
+    const services = [0, 1].map(
+      () => new MetadataService(new PostgresMetadataStore({ pool: pool(), schema, logger: silent })),
+    );
+    const results = await Promise.allSettled(services.map((s, i) => s.initAdminUser({ username: `racer${i}` })));
+    const failed = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]!.reason).toBeInstanceOf(MetadataError);
+    expect((failed[0]!.reason as MetadataError).code).toBe("already_initialized");
   });
 
   it("concurrent singleton creates: exactly one extraction group", async () => {

@@ -423,10 +423,20 @@ export class MetadataService {
     }
 
     // 核心操作：创建 admin 用户
-    const created = await this.createUserWithType(
-      { username: input.username, default_key_value: input.user_key },
-      "system_admin",
-    );
+    // Two processes on one shared store (e.g. Postgres) can both pass the
+    // checks above; the ux_meta_users_system_admin index rejects the loser.
+    let created: Awaited<ReturnType<typeof this.createUserWithType>>;
+    try {
+      created = await this.createUserWithType(
+        { username: input.username, default_key_value: input.user_key },
+        "system_admin",
+      );
+    } catch (err) {
+      if (isDriverUniqueViolation(err) && (await this.store.countSystemAdmins()) > 0) {
+        throw new MetadataError("already_initialized", "system_admin already exists");
+      }
+      throw err;
+    }
 
     // 辅助操作：自动创建默认 Team 和 Agent（失败不阻塞核心流程）
     try {

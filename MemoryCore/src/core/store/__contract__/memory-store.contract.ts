@@ -26,6 +26,8 @@ import type { IMemoryStore, ProfileFilter, ProfileSyncRecord } from "../types.js
 import type { MemoryRecord } from "../../record/l1-writer.js";
 import { buildFtsQuery } from "../tokenize.js";
 import { isProfileRowStore } from "../profile-row-store.js";
+import type { EmbeddingService } from "../embedding.js";
+import { executeConversationSearch } from "../../tools/conversation-search.js";
 
 export interface MemoryStoreContractHarness {
   /** Human-readable backend label used in test titles. */
@@ -124,6 +126,12 @@ export function runMemoryStoreContract(harness: MemoryStoreContractHarness): voi
     return run();
   };
 
+  // Conversation search polls until it returns `limit` rows on eventually-consistent backends.
+  const searchExpectOne = async (
+    run: () => Promise<{ results: unknown[] }>,
+  ): Promise<Awaited<ReturnType<typeof executeConversationSearch>>> =>
+    (ftsEventuallyConsistent ? pollUntil(run, (r) => r.results.length === 3) : run()) as never;
+
   describe(`IMemoryStore contract [${backend}]`, () => {
     it("init → non-degraded + capability shape", async () => {
       const store = await harness.createStore();
@@ -174,6 +182,27 @@ export function runMemoryStoreContract(harness: MemoryStoreContractHarness): voi
 
         expect(await store.deleteL1Batch(["l1-a"])).toBe(true);
         expect(await store.countL1()).toBe(1);
+      } finally {
+        await harness.disposeStore(store);
+      }
+    });
+
+    it("queryL1Records({ recordIds }) returns only the named rows", async () => {
+      const store = await harness.createStore();
+      try {
+        for (const [i, team] of ["team-a", "team-a", "team-b", "team-a", "team-b"].entries()) {
+          await store.upsertL1(makeL1(`l1-id-${i}`, `record number ${i}`, { teamId: team } as Partial<MemoryRecord>));
+        }
+        const ids = async (filter: Parameters<IMemoryStore["queryL1Records"]>[0]) =>
+          (await store.queryL1Records(filter)).map((r) => r.record_id).sort();
+
+        expect(await ids({ recordIds: ["l1-id-1", "l1-id-3"] })).toEqual(["l1-id-1", "l1-id-3"]);
+        expect(await ids({ recordIds: ["l1-id-missing"] })).toEqual([]);
+        // Ids combine with the other filters.
+        expect(await ids({ recordIds: ["l1-id-1", "l1-id-2"], teamId: "team-a" })).toEqual(["l1-id-1"]);
+        expect(await ids({ recordIds: ["l1-id-1"], sessionKey: "sk-other" })).toEqual([]);
+        // An empty id list keeps the unfiltered behaviour.
+        expect((await ids({ recordIds: [] })).length).toBe(5);
       } finally {
         await harness.disposeStore(store);
       }
@@ -233,6 +262,47 @@ export function runMemoryStoreContract(harness: MemoryStoreContractHarness): voi
         );
         expect(l1Hits.some((r) => r.record_id === "l1-ta")).toBe(true);
         expect(l1Hits.some((r) => r.record_id === "l1-tb")).toBe(false);
+      } finally {
+        await harness.disposeStore(store);
+      }
+    });
+
+    it("filtered FTS applies the filter before the limit (L0 + L1)", async () => {
+      const store = await harness.createStore();
+      try {
+        // 200 better matches outside the filter, 3 weaker matches inside it.
+        for (let i = 0; i < 200; i++) {
+          await store.upsertL0(makeL0(`l0-far-${i}`, STRONG_TEXT, TEAM_B));
+          await store.upsertL1(makeL1(`l1-far-${i}`, STRONG_TEXT, TEAM_B));
+        }
+        for (let i = 0; i < 3; i++) {
+          await store.upsertL0(makeL0(`l0-hit-${i}`, WEAK_TEXT, TEAM_A));
+          await store.upsertL1(makeL1(`l1-hit-${i}`, WEAK_TEXT, TEAM_A));
+        }
+        const q = fts("zebra");
+        const l0 = await searchExpect(
+          () => Promise.resolve(store.searchL0Fts(q, 3, TEAM_A_FILTER)),
+          (rows) => rows.length === 3,
+        );
+        expect(l0.map((r) => r.record_id).sort()).toEqual(["l0-hit-0", "l0-hit-1", "l0-hit-2"]);
+        const l1 = await searchExpect(
+          () => Promise.resolve(store.searchL1Fts(q, 3, TEAM_A_FILTER)),
+          (rows) => rows.length === 3,
+        );
+        expect(l1.map((r) => r.record_id).sort()).toEqual(["l1-hit-0", "l1-hit-1", "l1-hit-2"]);
+      } finally {
+        await harness.disposeStore(store);
+      }
+    });
+
+    it("conversation search by session returns that session's messages (keyword only)", async () => {
+      const store = await harness.createStore();
+      try {
+        await seedSessionSearch(store);
+        const res = await searchExpectOne(() =>
+          executeConversationSearch({ query: "zebra", limit: 3, sessionKey: "sk-target", vectorStore: store }),
+        );
+        expect(res.results.map((r) => r.id).sort()).toEqual(["target-0", "target-1", "target-2"]);
       } finally {
         await harness.disposeStore(store);
       }
@@ -439,6 +509,41 @@ const TEAM_A = { teamId: "team-a", agentId: "agent-a" } as Partial<MemoryRecord>
 const TEAM_B = { teamId: "team-b", agentId: "agent-a" } as Partial<MemoryRecord> & Record<string, unknown>;
 const TEAM_A_FILTER = { teamId: "team-a", agentId: "agent-a" };
 
+/** A short text that ranks above WEAK_TEXT for the keyword "zebra". */
+const STRONG_TEXT = "zebra zebra";
+const WEAK_TEXT = "zebra seen once among many other unrelated words about weather, trains, coffee and gardens";
+
+/**
+ * 200 messages of other sessions that match "zebra" better (keyword and, when
+ * `dims` is set, vector) than the 3 messages of session "sk-target".
+ */
+async function seedSessionSearch(store: IMemoryStore, dims = 0): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    await store.upsertL0(
+      makeL0(`other-${i}`, STRONG_TEXT, { sessionKey: `sk-other-${i % 10}` }),
+      dims ? vec(dims, 0, i / 1000) : undefined,
+    );
+  }
+  for (let i = 0; i < 3; i++) {
+    await store.upsertL0(
+      makeL0(`target-${i}`, WEAK_TEXT, { sessionKey: "sk-target" }),
+      dims ? farMatch(dims, i) : undefined,
+    );
+  }
+}
+
+/** Embedding stub: every text embeds on axis 0, next to the other sessions' messages. */
+function axisZeroEmbedding(dims: number): EmbeddingService {
+  return {
+    embed: async () => vec(dims, 0),
+    embedBatch: async (texts: string[]) => texts.map(() => vec(dims, 0)),
+    getDimensions: () => dims,
+    getProviderInfo: () => ({ provider: "contract-stub", model: "axis-0" }),
+    isReady: () => true,
+    startWarmup: () => {},
+  } as unknown as EmbeddingService;
+}
+
 function expectScoresDescending(rows: Array<{ score: number }>): void {
   for (let i = 1; i < rows.length; i++) {
     expect(rows[i - 1].score).toBeGreaterThanOrEqual(rows[i].score);
@@ -575,6 +680,21 @@ function runVectorCases(harness: MemoryStoreContractHarness): void {
         }
       },
     );
+
+    it("conversation search by session returns that session's messages (hybrid)", async () => {
+      const store = await harness.createStore();
+      try {
+        await seedSessionSearch(store, dims);
+        const run = () => executeConversationSearch({
+          query: "zebra", limit: 3, sessionKey: "sk-target", vectorStore: store,
+          embeddingService: axisZeroEmbedding(dims),
+        });
+        const res = harness.ftsEventuallyConsistent ? await pollUntil(run, (r) => r.results.length === 3) : await run();
+        expect(res.results.map((r) => r.id).sort()).toEqual(["target-0", "target-1", "target-2"]);
+      } finally {
+        await harness.disposeStore(store);
+      }
+    });
 
     it("store without vector support: vector search empty, keyword search works", async () => {
       const store = await harness.createStore({ dimensions: 0 });

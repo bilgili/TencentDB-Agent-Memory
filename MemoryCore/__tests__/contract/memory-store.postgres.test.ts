@@ -99,12 +99,15 @@ describePg("PostgresMemoryStore", () => {
     expect(await store.countL1()).toBe(1);
   });
 
-  it("a closed store returns empty results and never ends the shared pool", async () => {
+  it("a closed store: gated methods return their fallback, others reject, the shared pool stays open", async () => {
     const store = await open(newSchema(), DIMS);
     await store.upsertL1(l1("c", "closed"));
     store.close();
     expect(await store.countL1()).toBe(0);
     expect(await store.upsertL1(l1("c2", "after close"))).toBe(false);
+    // Methods outside the fault-tolerant set reject instead of faking success.
+    const msg = { id: "c-l0", sessionKey: "sk", sessionId: "sid", role: "user", messageText: "after close", recordedAt: new Date().toISOString(), timestamp: Date.now() };
+    await expect(store.insertL0Batch([msg])).rejects.toThrow(/store is closed/);
     expect((await pool().query("SELECT 1 AS one")).rows[0].one).toBe(1);
   });
 

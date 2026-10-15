@@ -8,7 +8,7 @@
  */
 
 import type { DbKind } from "./core/backend-selection/types.js";
-import { isDbKind } from "./core/backend-selection/traits.js";
+import { parseStoreMode } from "./core/backend-selection/traits.js";
 
 // ============================
 // Type definitions
@@ -596,8 +596,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
   const bm25Group = obj(c, "bm25");
 
   // --- Store backend ---
-  const storeBackendRaw = str(c, "storeBackend") ?? "sqlite";
-  const storeBackend: StoreBackend = isDbKind(storeBackendRaw) ? storeBackendRaw : "sqlite";
+  const storeBackend: StoreBackend = parseStoreMode(str(c, "storeBackend"), "sqlite", "memory.storeBackend");
   const postgresGroup = obj(c, "postgres");
 
   // --- TCVDB config ---

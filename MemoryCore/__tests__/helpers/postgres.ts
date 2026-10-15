@@ -15,7 +15,7 @@ export const TEST_POSTGRES_URL = process.env.TEST_POSTGRES_URL?.trim() || undefi
 /** `describe` that skips when no test database is configured. */
 export const describePg = describe.skipIf(!TEST_POSTGRES_URL);
 
-/** Random prefix that satisfies the schema-prefix rule `^[a-z_][a-z0-9_]{0,15}$`. */
+/** Random prefix that satisfies the schema-prefix rule `^[a-z][a-z0-9]{0,15}$`. */
 export function randomSchemaPrefix(): string {
   return `t${randomBytes(4).toString("hex")}`;
 }
@@ -38,7 +38,7 @@ export async function withTestClient<T>(fn: (client: pg.Client) => Promise<T>): 
 
 /** Drop every schema whose name starts with `${prefix}_`. Returns the dropped names. */
 export async function dropSchemasWithPrefix(prefix: string): Promise<string[]> {
-  if (!/^[a-z_][a-z0-9_]{0,15}$/.test(prefix)) {
+  if (!/^[a-z][a-z0-9]{0,15}$/.test(prefix)) {
     throw new Error(`refusing to drop schemas for unsafe prefix: ${prefix}`);
   }
   return withTestClient(async (client) => {

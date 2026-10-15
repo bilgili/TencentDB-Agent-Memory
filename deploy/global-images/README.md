@@ -111,6 +111,7 @@ Put these settings in `.env`. In `.env`, write `MEMORY_CORE_STORE_MODE=postgres`
 | Gateway: memory and skill store | `POSTGRES_URL` | none | Connection URL (Uniform Resource Locator). Required when `STORE_MODE=postgres`. |
 | Gateway: memory and skill store | `POSTGRES_SCHEMA_PREFIX` | `tdai` | Prefix of the schema names. |
 | Gateway: memory and skill store | `POSTGRES_POOL_MAX` | `10` | Maximum connections in the pool. |
+| Gateway | `TDAI_SHUTDOWN_DRAIN_MS` | `5000` | Maximum time in milliseconds that the gateway waits for running requests when it stops. Then it closes the open connections. The full stop must fit the grace period of the platform (`docker stop` waits 10 seconds). |
 | Plugin and `TdaiCore` path | `memory.storeBackend: "postgres"` and `memory.postgres.{url,schemaPrefix,poolMax}` | same as above | Same meaning as the gateway settings, for the path without a gateway. |
 | Metadata store | `TDAI_METADATA_POSTGRES_URL` | none | Selects Postgres for the metadata store. Do not set it together with `TDAI_METADATA_MONGO_URI`. |
 | Metadata store | `TDAI_METADATA_POSTGRES_SCHEMA_PREFIX` | `tdai` | Prefix of the metadata schema names. |
@@ -121,6 +122,7 @@ Put these settings in `.env`. In `.env`, write `MEMORY_CORE_STORE_MODE=postgres`
 
 The gateway stops at start in these cases:
 
+- `STORE_MODE` has a value that is not `sqlite`, `tcvdb`, `mongodb` or `postgres`. An empty value selects the default.
 - `STORE_MODE=postgres` without `POSTGRES_URL`.
 - Both `TDAI_METADATA_POSTGRES_URL` and `TDAI_METADATA_MONGO_URI` are set.
 - A URL has a wrong scheme, or a schema prefix is not valid.

@@ -12,8 +12,8 @@ describePg("postgres test helpers", () => {
   });
 
   it("randomSchemaPrefix satisfies the schema-prefix rule", () => {
-    expect(prefix).toMatch(/^[a-z_][a-z0-9_]{0,15}$/);
-    expect(prefix.startsWith("pg_")).toBe(false);
+    expect(prefix).toMatch(/^[a-z][a-z0-9]{0,15}$/);
+    expect(prefix).not.toBe("pg");
   });
 
   it("dropSchemasWithPrefix drops only schemas with the prefix", async () => {

@@ -281,6 +281,39 @@ describePg("PostgresSkillStore", () => {
     mem.close();
   });
 
+  it("a vector write error turns skill vectors off for good and never retries DDL", async () => {
+    const schema = newSchema();
+    const mem = new PostgresMemoryStore({ pool: pool(), schema, dimensions: DIMS, logger: silent });
+    await mem.init();
+    const logger = { ...silent, error: vi.fn() };
+    const store = new PostgresSkillStore({ pool: pool(), schema, dimensions: DIMS, logger });
+    store.init();
+    await store.countVersions("warm-up");
+    expect(store.getCapabilities().vectorSearch).toBe(true);
+    await store.appendVersion(input("drop", "v1"));
+
+    // Another process drops the column under the running store.
+    await withTestClient((c) => c.query(`ALTER TABLE "${schema}".skills DROP COLUMN embedding`));
+    const hasColumn = async () =>
+      (await withTestClient((c) =>
+        c.query(
+          `SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'skills' AND column_name = 'embedding'`,
+          [schema],
+        ),
+      )).rowCount === 1;
+
+    await expect(store.upsertEmbedding("drop", new Float32Array(DIMS).fill(1))).resolves.toBeUndefined();
+    expect(store.getCapabilities().vectorSearch).toBe(false);
+    await store.upsertEmbedding("drop", new Float32Array(DIMS).fill(1));
+    await store.deleteEmbedding("drop");
+
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(await hasColumn()).toBe(false);
+    expect((await store.getHead("drop"))?.content).toBe("v1");
+    store.close();
+    mem.close();
+  });
+
   it("a closed store returns empty reads and never ends the shared pool", async () => {
     const store = await open();
     await store.appendVersion(input("closed", "v1"));

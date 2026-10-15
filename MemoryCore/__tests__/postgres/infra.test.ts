@@ -5,10 +5,12 @@
  *
  * Pure tests always run; `describePg` blocks need TEST_POSTGRES_URL.
  */
+import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type pg from "pg";
-import { DB_TRAITS, isDbKind, LocalBackendResolver } from "../../src/core/backend-selection/index.js";
+import { DB_TRAITS, isDbKind, LocalBackendResolver, parseStoreMode } from "../../src/core/backend-selection/index.js";
+import { parseConfig } from "../../src/config.js";
 import { InstanceConfigProvider, LocalConfigSource } from "../../src/core/instance-config-provider.js";
 import { isForeignKeyViolation, isUniqueViolation } from "../../src/core/store/errors.js";
 import { compareVersions, ensureVectorExtension, runMigrations } from "../../src/core/store/postgres/migrate.js";
@@ -16,6 +18,7 @@ import type { Migration } from "../../src/core/store/postgres/migrate.js";
 import { PgPoolRegistry } from "../../src/core/store/postgres/pool-registry.js";
 import { pgSchemaName, validateSchemaPrefix } from "../../src/core/store/postgres/schema-name.js";
 import { parsePostgresSettings, redactUrl } from "../../src/core/store/postgres/settings.js";
+import * as tx from "../../src/core/store/postgres/tx.js";
 import { withTx, withWriteTx } from "../../src/core/store/postgres/tx.js";
 import { buildPgTsQuery } from "../../src/core/store/tokenize.js";
 import { describePg, dropSchemasWithPrefix, randomSchemaPrefix, TEST_POSTGRES_URL } from "../helpers/postgres.js";
@@ -35,6 +38,21 @@ describe("backend registry", () => {
   it("isDbKind accepts only the declared kinds", () => {
     for (const k of ["sqlite", "tcvdb", "mongodb", "postgres"]) expect(isDbKind(k)).toBe(true);
     for (const k of ["mysql", "toString", "", undefined, 1]) expect(isDbKind(k)).toBe(false);
+  });
+
+  it("parseStoreMode: unset or blank gives the default, a known kind is kept, anything else throws", () => {
+    expect(parseStoreMode(undefined, "tcvdb")).toBe("tcvdb");
+    expect(parseStoreMode("", "sqlite")).toBe("sqlite");
+    expect(parseStoreMode("  ", "sqlite")).toBe("sqlite");
+    for (const k of ["sqlite", "tcvdb", "mongodb", "postgres"] as const) expect(parseStoreMode(k, "sqlite")).toBe(k);
+    expect(() => parseStoreMode("postgress", "sqlite")).toThrow(/STORE_MODE.*sqlite, tcvdb, mongodb, postgres.*"postgress"/);
+    expect(() => parseStoreMode("toString", "sqlite")).toThrow(/STORE_MODE/);
+  });
+
+  it("parseConfig throws on an unknown memory.storeBackend and keeps the sqlite default", () => {
+    expect(() => parseConfig({ storeBackend: "postgress" })).toThrow(/memory\.storeBackend.*postgres/);
+    expect(parseConfig({}).storeBackend).toBe("sqlite");
+    expect(parseConfig({ storeBackend: "postgres" }).storeBackend).toBe("postgres");
   });
 
   it("LocalBackendResolver resolves STORE_MODE=postgres to a PostgresConfig with the instance schema", async () => {
@@ -105,8 +123,9 @@ describe("pgSchemaName / validateSchemaPrefix", () => {
   });
 
   it("accepts valid prefixes and refuses invalid or reserved ones, naming the setting", () => {
-    for (const p of ["tdai", "_x", "a1_b2", "p".repeat(16)]) expect(validateSchemaPrefix(p)).toBe(p);
-    for (const p of ["", "Tdai", "1abc", "a-b", "p".repeat(17), "pg_x", "pg"]) {
+    for (const p of ["tdai", "a1b2", "p".repeat(16)]) expect(validateSchemaPrefix(p)).toBe(p);
+    // No "_": the first "_" of a schema name must end the prefix.
+    for (const p of ["", "Tdai", "1abc", "a-b", "_x", "a1_b2", "a_mem", "tdai_", "p".repeat(17), "pg_x", "pg"]) {
       expect(() => validateSchemaPrefix(p, "POSTGRES_SCHEMA_PREFIX")).toThrow(/POSTGRES_SCHEMA_PREFIX/);
     }
     // "pgx" does not produce a pg_ schema name.
@@ -176,6 +195,9 @@ describe("redactUrl / parsePostgresSettings", () => {
     expect(() => parsePostgresSettings({ url: "postgres://db/x", schemaPrefix: "pg_bad" })).toThrow(
       /POSTGRES_SCHEMA_PREFIX/,
     );
+    expect(() => parsePostgresSettings({ url: "postgres://db/x", schemaPrefix: "a_mem" })).toThrow(
+      /POSTGRES_SCHEMA_PREFIX="a_mem"/,
+    );
     for (const poolMax of ["0", "-1", "1.5", "abc"]) {
       expect(() => parsePostgresSettings({ url: "postgres://db/x", poolMax })).toThrow(/POSTGRES_POOL_MAX/);
     }
@@ -235,6 +257,28 @@ describe("isUniqueViolation / isForeignKeyViolation", () => {
     expect(isUniqueViolation(err, "other")).toBe(false);
     expect(isForeignKeyViolation({ code: "23503", constraint: "fk_a" }, "fk_a")).toBe(true);
     expect(isForeignKeyViolation({ code: "23505" })).toBe(false);
+  });
+});
+
+// MemoryCore and MemoryKnowledge share one Postgres database and take advisory
+// locks keyed by (class, hashtext(schema)). The classes must stay equal across
+// the two packages and distinct from each other, or one package's lock blocks
+// or fails to exclude the other's.
+describe("advisory lock classes", () => {
+  it("every MemoryKnowledge class exists in tx.ts with the same value; tx.ts values are distinct", () => {
+    const knowledgeSrc = readFileSync(new URL("../../../MemoryKnowledge/src/db/client.ts", import.meta.url), "utf8");
+    const knowledge = [...knowledgeSrc.matchAll(/export const (LOCK_CLASS_\w+)\s*=\s*([0-9a-fA-Fx_]+)\s*;/g)].map(
+      ([, name, literal]) => [name, Number(literal.replace(/_/g, ""))] as const,
+    );
+    expect(knowledge.length).toBeGreaterThan(0);
+
+    const core = Object.entries(tx).filter(([name]) => name.startsWith("LOCK_CLASS_")) as Array<[string, number]>;
+    const coreByName = new Map(core);
+    for (const [name, value] of knowledge) {
+      expect(Number.isInteger(value), `${name} parses`).toBe(true);
+      expect(coreByName.get(name), name).toBe(value);
+    }
+    expect(new Set(core.map(([, v]) => v)).size).toBe(core.length);
   });
 });
 

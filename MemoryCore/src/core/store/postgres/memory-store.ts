@@ -10,6 +10,10 @@
  * - `_ensureInit()` gates every data call: migrations, the pgvector
  *   step, the CJK self-test and the vector-column step run once; a failure
  *   resets the promise so the next call retries.
+ * - After `close()`: the fault-tolerant L0/L1 methods (the ones wrapped in
+ *   `safe()`) return their empty fallback; every other method rejects with
+ *   "store is closed". Writes never report success they did not make, so
+ *   callers and worker retries see the failure.
  * - Static tables are versioned migrations. The `embedding` columns are
  *   NOT a migration: their dimension is data (`embedding_meta.vector_dimensions`),
  *   so `ensureVectorColumns` adds them for the first configured dimension under
@@ -790,7 +794,7 @@ export class PostgresMemoryStore implements IMemoryStore {
       if (sessionId) c.push(`session_id = ${p(params, sessionId)}`);
       else if (sessionKey) c.push(`session_key = ${p(params, sessionKey)}`);
       if (updatedAfter) c.push(`updated_time > ${p(params, updatedAfter)}`);
-      // Narrow by ids only when given (MongoDB/TCVDB parity; the SQLite store ignores recordIds).
+      // Narrow by ids only when given (parity with the other backends).
       if (filter?.recordIds && filter.recordIds.length > 0) c.push(`record_id = ANY(${p(params, filter.recordIds)}::text[])`);
       if (filter?.teamId !== undefined) c.push(`team_id = ${p(params, filter.teamId)}`);
       if (filter?.userId !== undefined) c.push(`user_id = ${p(params, filter.userId)}`);

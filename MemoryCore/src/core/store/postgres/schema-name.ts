@@ -9,6 +9,11 @@
  *     id) is appended, so two different ids never share a name.
  * Every hashed name ends in `_<10 hex>` and no pass-through name does, so a
  * pass-through id can never equal another id's hashed name.
+ *
+ * A prefix holds no `_`, so the first `_` of a schema name ends the prefix and
+ * two different (prefix, kind, id) triples never give one name (`a_meta` + `mem`
+ * + `x` would otherwise equal `a` + `meta` + `mem_x`). The only remaining
+ * collision is the 40-bit hash of hashed names.
  */
 
 import { createHash } from "node:crypto";
@@ -20,7 +25,7 @@ export const DEFAULT_SCHEMA_PREFIX = "tdai";
 /** Postgres NAMEDATALEN - 1. */
 const MAX_IDENT_BYTES = 63;
 const HASH_HEX_CHARS = 10;
-const PREFIX_RE = /^[a-z_][a-z0-9_]{0,15}$/;
+const PREFIX_RE = /^[a-z][a-z0-9]{0,15}$/;
 /** The suffix of every hashed name; a pass-through id must not end in it. */
 const HASHED_SUFFIX_RE = /_[0-9a-f]{10}$/;
 
@@ -28,14 +33,13 @@ const HASHED_SUFFIX_RE = /_[0-9a-f]{10}$/;
  * Throw unless `prefix` is a usable schema prefix. The error names
  * `settingName`, so a startup failure points at the bad variable.
  *
- * Besides the prefix regex, refuse any prefix that makes the schema name start
- * with `pg_` (reserved by Postgres) — that is a `pg_…` prefix and also the
- * bare prefix `pg`, because names are `${prefix}_${kind}_…`.
+ * Besides the prefix regex, refuse the prefix `pg`: names are
+ * `${prefix}_${kind}_…`, and schema names starting with `pg_` are reserved by Postgres.
  */
 export function validateSchemaPrefix(prefix: string, settingName = "POSTGRES_SCHEMA_PREFIX"): string {
   if (!PREFIX_RE.test(prefix)) {
     throw new Error(
-      `${settingName}="${prefix}" is invalid: it must match ^[a-z_][a-z0-9_]{0,15}$`,
+      `${settingName}="${prefix}" is invalid: it must match ^[a-z][a-z0-9]{0,15}$ (no "_")`,
     );
   }
   if (`${prefix}_`.startsWith("pg_")) {

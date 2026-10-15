@@ -553,27 +553,40 @@ export class PostgresSkillStore implements ISkillStore {
 
   /** Store the head row's vector. Non-fatal: a failure only logs. */
   async upsertEmbedding(skillId: string, embedding: Float32Array): Promise<void> {
-    try {
-      if (!(await this.open()) || !this.vectorReady) return;
-      if (embedding.length !== this.dimensions) {
-        this.logger?.warn(`${TAG} embedding dim mismatch: ${embedding.length} vs ${this.dimensions}`);
-        return;
-      }
-      await this.q(
-        `UPDATE ${this.s}.skills SET embedding = $2::${this.vecType} WHERE skill_id = $1 AND is_head`,
-        [skillId, vecLiteral(embedding)],
-      );
-    } catch (err) {
-      this.logger?.warn(`${TAG} upsertEmbedding failed: ${errMsg(err)}`);
+    if (embedding.length !== this.dimensions) {
+      this.logger?.warn(`${TAG} embedding dim mismatch: ${embedding.length} vs ${this.dimensions}`);
+      return;
     }
+    await this.vectorWrite(
+      "upsertEmbedding",
+      `UPDATE ${this.s}.skills SET embedding = $2::${this.vecType} WHERE skill_id = $1 AND is_head`,
+      [skillId, vecLiteral(embedding)],
+    );
   }
 
   async deleteEmbedding(skillId: string): Promise<void> {
+    await this.vectorWrite("deleteEmbedding", `UPDATE ${this.s}.skills SET embedding = NULL WHERE skill_id = $1`, [skillId]);
+  }
+
+  /**
+   * Run one vector write. Vectors only ever turn off in a running process:
+   * another process can drop or retype the column with DDL, so any write error
+   * disables skill vectors for this store until restart (logged once). No DDL
+   * is retried here; the next init re-reads the stored dimension.
+   */
+  private async vectorWrite(op: string, sql: string, params: unknown[]): Promise<void> {
     try {
       if (!(await this.open()) || !this.vectorReady) return;
-      await this.q(`UPDATE ${this.s}.skills SET embedding = NULL WHERE skill_id = $1`, [skillId]);
     } catch (err) {
-      this.logger?.warn(`${TAG} deleteEmbedding failed: ${errMsg(err)}`);
+      this.logger?.warn(`${TAG} ${op} skipped: ${errMsg(err)}`);
+      return;
+    }
+    try {
+      await this.q(sql, params);
+    } catch (err) {
+      if (!this.vectorReady) return; // a concurrent write already turned vectors off and logged
+      this.vectorReady = false;
+      this.logger?.error(`${TAG} ${this.schema}: ${op} failed; skill vectors disabled until restart: ${errMsg(err)}`);
     }
   }
 }

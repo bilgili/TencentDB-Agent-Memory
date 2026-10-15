@@ -24,7 +24,7 @@ import { TdaiCore } from "../core/tdai-core.js";
 import { StandaloneHostAdapter } from "../adapters/standalone/host-adapter.js";
 import { loadGatewayConfig, parseBrokers } from "./config.js";
 import type { GatewayConfig, GatewayConfigOverrides } from "./config.js";
-import { DB_TRAITS, isDbKind, LocalBackendResolver } from "../core/backend-selection/index.js";
+import { DB_TRAITS, LocalBackendResolver, parseStoreMode } from "../core/backend-selection/index.js";
 import type { BackendResolver, DbChoice } from "../core/backend-selection/index.js";
 import { applyMetadataEnvFromGatewayConfig } from "./metadata-env.js";
 import { applyTaskSourceEnvFromGatewayConfig } from "./task-source-env.js";
@@ -50,6 +50,7 @@ import type {
   GatewayErrorResponse,
 } from "./types.js";
 import type { Logger } from "../core/types.js";
+import { drainHttpServer, shutdownDrainMs } from "./drain.js";
 import { InstanceConfigProvider } from "../core/instance-config-provider.js";
 import type { MongoConfig } from "../core/instance-config-provider.js";
 import { wrapWithTrace } from "../core/report/trace-middleware.js";
@@ -858,17 +859,19 @@ export class TdaiGateway {
   private async doStop(): Promise<void> {
     this.logger.info("Shutting down gateway...");
 
-    // close HTTP intake and drain in-flight requests FIRST, so no
-    // request runs against a closed store or an ended Postgres/Mongo pool.
-    // server.close() stops accepting and calls back once every connection ended;
-    // closeIdleConnections() drops idle keep-alive sockets so they do not hold it.
+    // Close HTTP intake and drain in-flight requests FIRST, so no request runs
+    // against a closed store or an ended Postgres/Mongo pool within the drain
+    // limit (TDAI_SHUTDOWN_DRAIN_MS, default 5000). After the limit the open
+    // connections are closed, but a handler still running keeps running and its
+    // later store calls fail or return a fallback. The whole stop sequence must
+    // fit the platform's grace period (docker stop: 10 s).
     if (this.server) {
-      const server = this.server;
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-        server.closeIdleConnections();
-      });
-      this.logger.info("HTTP server closed (in-flight requests drained)");
+      const forced = await drainHttpServer(this.server, shutdownDrainMs(), this.logger);
+      this.logger.info(
+        forced === 0
+          ? "HTTP server closed (in-flight requests drained)"
+          : `HTTP server closed (${forced} connection(s) closed at the drain limit)`,
+      );
     }
 
     // 优雅关闭 OTel SDK（flush 剩余 Span/Log）
@@ -1960,8 +1963,11 @@ export class TdaiGateway {
     // service-mode integration smoke tests where Redis + COS are real but no
     // VDB is available — set STORE_MODE=sqlite to keep the VDB-dependent
     // pieces local while exercising the rest of the service-mode wiring.
-    const storeModeOverride = isDbKind(process.env.STORE_MODE) ? process.env.STORE_MODE : undefined;
-    const effectiveStoreMode = storeModeOverride ?? (this.config.deployMode === "service" ? "tcvdb" : "sqlite");
+    // An unknown value stops startup (parseStoreMode throws); unset or empty keeps the deploy-mode default.
+    const effectiveStoreMode = parseStoreMode(
+      process.env.STORE_MODE,
+      this.config.deployMode === "service" ? "tcvdb" : "sqlite",
+    );
     // T12 fail-fast: mongodb backend hard-requires MONGODB_ENDPOINT/DATABASE
     // (delivered via LocalConfigSource.fetchMongo). Missing them is a config
     // error we surface at boot instead of on the first request.
@@ -2002,13 +2008,13 @@ export class TdaiGateway {
     this.logger.info(`Instance Config Provider + Store Pool initialized (mode=${this.config.deployMode})`);
 
     // P9 选择层接入：装配层（resolveStoreBackendConfigs / resolveStorageForInstance）
-    // 改走 resolver。storeMode 传显式覆盖值（未设置时 resolver 按形态兜底，规则与
-    // effectiveStoreMode 相同）；fileStore 已是 T3.0 解析后的确定值。
+    // 改走 resolver。storeMode 传 parseStoreMode 解析后的确定值（STORE_MODE 未设置时
+    // 即按形态兜底的默认值）；fileStore 已是 T3.0 解析后的确定值。
     // TDAI_BACKEND_RESOLVER=off → 不构建 resolver，装配层回退旧全局开关分支。
     if (this.config.features.backendResolver) {
       this.backendResolver = new LocalBackendResolver({
         deployMode: this.config.deployMode,
-        storeMode: storeModeOverride,
+        storeMode: effectiveStoreMode,
         fileStore: this.config.data.fileStore,
         fileStoreOthers: this.config.data.fileStoreOthers,
         source: this.configProvider,

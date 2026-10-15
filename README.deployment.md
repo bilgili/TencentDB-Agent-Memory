@@ -514,6 +514,7 @@ If pgvector is missing or older than 0.8.0, the stores run without vector search
 | Gateway: memory and skill store | `POSTGRES_URL` | none | Connection URL (Uniform Resource Locator). Required when `STORE_MODE=postgres`. |
 | Gateway: memory and skill store | `POSTGRES_SCHEMA_PREFIX` | `tdai` | Prefix of the schema names. |
 | Gateway: memory and skill store | `POSTGRES_POOL_MAX` | `10` | Maximum connections in the pool. |
+| Gateway | `TDAI_SHUTDOWN_DRAIN_MS` | `5000` | Maximum time in milliseconds that the gateway waits for running requests when it stops. Then it closes the open connections. The full stop must fit the grace period of the platform (`docker stop` waits 10 seconds). |
 | Plugin and `TdaiCore` path | `memory.storeBackend: "postgres"` and `memory.postgres.{url,schemaPrefix,poolMax}` | same as above | Same meaning as the gateway settings, for the path without a gateway. |
 | Metadata store | `TDAI_METADATA_POSTGRES_URL` | none | Selects Postgres for the metadata store. Do not set it together with `TDAI_METADATA_MONGO_URI`. |
 | Metadata store | `TDAI_METADATA_POSTGRES_SCHEMA_PREFIX` | `tdai` | Prefix of the metadata schema names. |
@@ -524,6 +525,7 @@ If pgvector is missing or older than 0.8.0, the stores run without vector search
 
 The gateway stops at start in these cases:
 
+- `STORE_MODE` has a value that is not `sqlite`, `tcvdb`, `mongodb` or `postgres`. An empty value selects the default.
 - `STORE_MODE=postgres` without `POSTGRES_URL`.
 - Both `TDAI_METADATA_POSTGRES_URL` and `TDAI_METADATA_MONGO_URI` are set.
 - A URL has a wrong scheme, or a schema prefix is not valid.
@@ -538,7 +540,9 @@ Each instance has its own schemas. The services create them at first start.
 - `<prefix>_meta_<instanceId>`: metadata store.
 - The schema in `KNOWLEDGE_DB_SCHEMA`: MemoryKnowledge.
 
-A schema prefix matches `^[a-z_][a-z0-9_]{0,15}$` and does not start with `pg_`.
+A schema prefix matches `^[a-z][a-z0-9]{0,15}$` and is not `pg`. A prefix has no `_`, so the first `_` of a schema name ends the prefix and two instances never get the same schema name. A service with an invalid prefix stops at startup and names the setting.
+
+`KNOWLEDGE_DB_SCHEMA` has its own rule. When MemoryKnowledge uses the same database as MemoryCore, do not set `KNOWLEDGE_DB_SCHEMA` to a name that starts with `<prefix>_mem_` or `<prefix>_meta_`.
 
 ### Connection limit
 

@@ -21,9 +21,9 @@
       },
       "storeBackend": {
         "type": "string",
-        "enum": ["sqlite", "tcvdb"],
+        "enum": ["sqlite", "tcvdb", "mongodb", "postgres"],
         "default": "sqlite",
-        "description": "存储后端：sqlite（本地 SQLite + sqlite-vec）或 tcvdb（腾讯云向量数据库）。仅 local/function 模式生效"
+        "description": "存储后端：sqlite（本地 SQLite + sqlite-vec）、tcvdb（腾讯云向量数据库）、mongodb 或 postgres（Postgres + pgvector）。仅 local/function 模式生效"
       },
       "server": {
         "type": "object",

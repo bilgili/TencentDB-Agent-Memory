@@ -34,6 +34,9 @@ import type { VdbConfig, MongoConfig } from "../instance-config-provider.js";
 import type { DbChoice, DbKind } from "../backend-selection/types.js";
 import type { ISkillStore } from "../skill/skill-store.interface.js";
 import { redactUrl } from "./postgres/settings.js";
+import { getSharedPgPoolRegistry } from "./postgres/pool-registry.js";
+import { PostgresMemoryStore } from "./postgres/memory-store.js";
+import type { PostgresConfig } from "../instance-config-provider.js";
 import { metricProducer } from "../report/kafka-metric-producer.js";
 
 const TAG = "[store-pool]";
@@ -69,7 +72,7 @@ function unknownDbKind(db: never): never {
   throw new Error(`${TAG} unknown db kind: ${(db as { kind?: unknown }).kind}`);
 }
 
-/** Thrown for the postgres branch until the Postgres stores exist. */
+/** Thrown for the postgres skill-store branch until PostgresSkillStore exists. */
 function postgresNotImplemented(what: string): never {
   throw new Error(`${TAG} Postgres ${what} not implemented yet`);
 }
@@ -241,7 +244,7 @@ export class StorePool {
       case "mongodb":
         return this.createMongoStore(db.conn);
       case "postgres":
-        return postgresNotImplemented("memory store");
+        return this.createPostgresStore(db.conn);
       default:
         return unknownDbKind(db);
     }
@@ -486,12 +489,12 @@ export class StorePool {
   // Internal — SQLite Store
   // ════════════════════════════════════════════════════════
 
-  private createSqliteStore(instanceId: string): PooledStore {
+  /** App-side embedding service for stores that keep their own vectors (sqlite, postgres). */
+  private createAppEmbedding(): EmbeddingService {
     // Embedding service (远端 API, 如 OpenAI text-embedding)
-    let embeddingService: EmbeddingService | undefined;
     const embCfg = this.memoryCfg.embedding;
     if (embCfg.enabled && embCfg.provider !== "local" && embCfg.provider !== "none" && embCfg.apiKey) {
-      embeddingService = createEmbeddingService({
+      return createEmbeddingService({
         provider: embCfg.provider,
         baseUrl: embCfg.baseUrl,
         apiKey: embCfg.apiKey,
@@ -500,7 +503,26 @@ export class StorePool {
         maxInputChars: embCfg.maxInputChars,
       }, this.logger as StoreLogger);
     }
+    return new NoopEmbeddingService() as unknown as EmbeddingService;
+  }
 
+  // ════════════════════════════════════════════════════════
+  // Internal — Postgres Store
+  // ════════════════════════════════════════════════════════
+
+  /** One shared pg.Pool per URL; the store owns its schema, never the pool. */
+  private createPostgresStore(conn: PostgresConfig): PooledStore {
+    const store = new PostgresMemoryStore({
+      pool: getSharedPgPoolRegistry(this.logger as StoreLogger).get(conn.url, conn.poolMax),
+      schema: conn.schema,
+      dimensions: this.memoryCfg.embedding.dimensions ?? 0,
+      logger: this.logger as StoreLogger,
+    });
+    return { store, embedding: this.createAppEmbedding(), bm25Encoder: this.sharedBm25Encoder };
+  }
+
+  private createSqliteStore(instanceId: string): PooledStore {
+    const embCfg = this.memoryCfg.embedding;
     const dims = embCfg.dimensions ?? 0;
     const dbPath = this.getSqlitePath(instanceId);
     // 确保数据库目录存在（对于非 default instance）
@@ -510,11 +532,7 @@ export class StorePool {
     }
     const store = new VectorStore(dbPath, dims, this.logger as StoreLogger);
 
-    return {
-      store,
-      embedding: (embeddingService ?? new NoopEmbeddingService()) as unknown as EmbeddingService,
-      bm25Encoder: this.sharedBm25Encoder,
-    };
+    return { store, embedding: this.createAppEmbedding(), bm25Encoder: this.sharedBm25Encoder };
   }
 
   /**

@@ -98,7 +98,7 @@ const META_PROVIDER = "embedding_provider_info";
  * as a string). Passed per query, not set globally, so the shared `pg` module
  * keeps its defaults for other users. Counts still cast `::int`.
  */
-const PG_TYPES = {
+export const PG_TYPES = {
   getTypeParser: ((oid: number, format?: string) =>
     oid === pg.types.builtins.INT8 && format !== "binary"
       ? (v: string) => Number(v)
@@ -308,8 +308,37 @@ function isZeroVector(v: Float32Array): boolean {
 }
 
 /** pgvector text literal (`[1,2,3]`), bound as a parameter and cast in SQL. */
-function vecLiteral(v: Float32Array): string {
+export function vecLiteral(v: Float32Array): string {
   return `[${Array.from(v).join(",")}]`;
+}
+
+/** Qualified vector type for `dims`: `"ext".vector` up to 2000 dims, `"ext".halfvec` above. */
+export function pgVectorType(extSchema: string, dims: number): string {
+  return `${quoteIdent(extSchema)}.${dims > MAX_VECTOR_HNSW_DIMS ? "halfvec" : "vector"}`;
+}
+
+/**
+ * Add `embedding <type>(dims)` plus its HNSW cosine index to one table of the
+ * mem schema (`s` = quoted schema). Shared by the memory and skill stores.
+ */
+export async function addVectorColumn(client: TxClient, s: string, table: string, extSchema: string, dims: number): Promise<void> {
+  const type = pgVectorType(extSchema, dims);
+  await client.query(`ALTER TABLE ${s}.${table} ADD COLUMN embedding ${type}(${dims})`);
+  // ponytail: above 4000 dims no HNSW index exists; search is an exact scan.
+  if (dims <= MAX_HALFVEC_HNSW_DIMS) {
+    await client.query(`CREATE INDEX idx_${table}_embedding ON ${s}.${table} USING hnsw (embedding ${type}_cosine_ops)`);
+  }
+}
+
+/**
+ * CJK self-test: the `simple` parser splits by the database
+ * LC_CTYPE. Returns the lexeme count of `'数据库 主库'`; 2 means keyword search works.
+ */
+export async function cjkLexemeCount(pool: pg.Pool): Promise<number> {
+  const { rows } = await pool.query<{ n: number }>(
+    "SELECT coalesce(array_length(tsvector_to_array(to_tsvector('simple', '数据库 主库')), 1), 0)::int AS n",
+  );
+  return rows[0]?.n ?? 0;
 }
 
 /**
@@ -439,13 +468,11 @@ export class PostgresMemoryStore implements IMemoryStore {
     if (applied.length > 0) this.logger?.info(`${TAG} ${this.schema}: applied migrations ${applied.join(",")}`);
 
     // CJK self-test: `simple` splits by the database LC_CTYPE.
-    const { rows: lex } = await this.q<{ n: number }>(
-      "SELECT coalesce(array_length(tsvector_to_array(to_tsvector('simple', '数据库 主库')), 1), 0)::int AS n",
-    );
-    this.ftsAvailable = lex[0]?.n === 2;
+    const lexemes = await cjkLexemeCount(this.pool);
+    this.ftsAvailable = lexemes === 2;
     if (!this.ftsAvailable) {
       this.logger?.error(
-        `${TAG} ${this.schema}: to_tsvector('simple', '数据库 主库') returned ${lex[0]?.n ?? 0} lexemes (expected 2); ` +
+        `${TAG} ${this.schema}: to_tsvector('simple', '数据库 主库') returned ${lexemes} lexemes (expected 2); ` +
           `keyword search disabled. Use a UTF-8 database locale.`,
       );
     }
@@ -492,23 +519,14 @@ export class PostgresMemoryStore implements IMemoryStore {
   }
 
   private useVectorType(extSchema: string, dims: number): void {
-    const ns = quoteIdent(extSchema);
-    this.vecType = `${ns}.${dims > MAX_VECTOR_HNSW_DIMS ? "halfvec" : "vector"}`;
-    this.distOp = `OPERATOR(${ns}.<=>)`;
+    this.vecType = pgVectorType(extSchema, dims);
+    this.distOp = `OPERATOR(${quoteIdent(extSchema)}.<=>)`;
   }
 
   /** Add `embedding` columns + HNSW indexes for `dims`, and record the dimension. */
   private async createVectorColumns(client: TxClient, extSchema: string, dims: number): Promise<void> {
-    const ns = quoteIdent(extSchema);
-    const half = dims > MAX_VECTOR_HNSW_DIMS;
-    const type = `${ns}.${half ? "halfvec" : "vector"}(${dims})`;
-    const ops = `${ns}.${half ? "halfvec_cosine_ops" : "vector_cosine_ops"}`;
     for (const t of ["l1_records", "l0_conversations"]) {
-      await client.query(`ALTER TABLE ${this.s}.${t} ADD COLUMN embedding ${type}`);
-      // ponytail: above 4000 dims no HNSW index exists; search is an exact scan.
-      if (dims <= MAX_HALFVEC_HNSW_DIMS) {
-        await client.query(`CREATE INDEX idx_${t}_embedding ON ${this.s}.${t} USING hnsw (embedding ${ops})`);
-      }
+      await addVectorColumn(client, this.s, t, extSchema, dims);
     }
     await client.query(
       `INSERT INTO ${this.s}.embedding_meta (key, value) VALUES ($1, $2)
@@ -611,6 +629,9 @@ export class PostgresMemoryStore implements IMemoryStore {
         await client.query(`DROP INDEX IF EXISTS ${this.s}.idx_${t}_embedding`);
         await client.query(`ALTER TABLE ${this.s}.${t} DROP COLUMN IF EXISTS embedding`);
       }
+      // The skill store shares this schema; it adds skills.embedding again for
+      // the new stored dimension on its next init (PostgresSkillStore).
+      await client.query(`ALTER TABLE IF EXISTS ${this.s}.skills DROP COLUMN IF EXISTS embedding`);
       await this.createVectorColumns(client, ext.schema!, dimensions);
     });
     this.vectorReady = dimensions === this.dimensions;

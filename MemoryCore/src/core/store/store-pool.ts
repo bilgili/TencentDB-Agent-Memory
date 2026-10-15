@@ -36,6 +36,7 @@ import type { ISkillStore } from "../skill/skill-store.interface.js";
 import { redactUrl } from "./postgres/settings.js";
 import { getSharedPgPoolRegistry } from "./postgres/pool-registry.js";
 import { PostgresMemoryStore } from "./postgres/memory-store.js";
+import { PostgresSkillStore } from "./postgres/skill-store.js";
 import type { PostgresConfig } from "../instance-config-provider.js";
 import { metricProducer } from "../report/kafka-metric-producer.js";
 
@@ -70,11 +71,6 @@ export type StoreMode = DbKind;
 
 function unknownDbKind(db: never): never {
   throw new Error(`${TAG} unknown db kind: ${(db as { kind?: unknown }).kind}`);
-}
-
-/** Thrown for the postgres skill-store branch until PostgresSkillStore exists. */
-function postgresNotImplemented(what: string): never {
-  throw new Error(`${TAG} Postgres ${what} not implemented yet`);
 }
 
 export interface KafkaMetricOptions {
@@ -399,7 +395,15 @@ export class StorePool {
         label = `tcvdb ${db.conn.url}/${db.conn.database}`;
         break;
       case "postgres":
-        return postgresNotImplemented("skill store");
+        // Same shared pool and mem schema as the memory store.
+        store = new PostgresSkillStore({
+          pool: getSharedPgPoolRegistry(this.logger as StoreLogger).get(db.conn.url, db.conn.poolMax),
+          schema: db.conn.schema,
+          dimensions: this.memoryCfg.embedding.dimensions ?? 0,
+          logger: this.logger as StoreLogger,
+        });
+        label = `postgres ${redactUrl(db.conn.url)}/${db.conn.schema}`;
+        break;
       case "sqlite":
         throw new Error(
           `${TAG} getSkillStore(${instanceId}): sqlite has no pooled skill store ` +
